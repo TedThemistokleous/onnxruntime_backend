@@ -322,8 +322,15 @@ RUN (command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y --
 # keyed only by ROCMLIR_REPO/ROCMLIR_COMMIT -- decouples the LLVM/MLIR build from
 # the (frequently-changing) MIGraphX and plugin-EP source: changing
 # MIGRAPHX_BRANCH or the EP no longer triggers an LLVM rebuild. ROCMLIR_COMMIT
-# MUST match the ROCm/rocMLIR@<sha> pin in MIGraphX's requirements.txt for ABI
-# compatibility; bump it to force a rocMLIR rebuild.
+# MUST match the ROCm/rocMLIR@<sha> (or ROCm/rocmlirTriton@<sha>) pin in MIGraphX's
+# requirements.txt for ABI compatibility; bump it to force a rebuild.
+#
+# NOTE: this LLVM/MLIR tree predates the C++17 removal of std::get_temporary_buffer,
+# which GCC 12's libstdc++ (Debian 12 base image) marks [[deprecated]]. The build is
+# configured with -DLLVM_ENABLE_WERROR=OFF plus -Wno-error=deprecated-declarations so
+# that deprecation is not fatal. If a future toolchain still fails here, either bump
+# ROCMLIR_COMMIT to a fork commit that drops the get_temporary_buffer path, or build
+# this layer with an older libstdc++ (e.g. GCC 11).
 #
 ARG ROCMLIR_REPO={}
 ARG ROCMLIR_COMMIT={}
@@ -337,10 +344,10 @@ RUN pip3 install --no-cache-dir ninja pybind11 && \\
     git checkout --detach FETCH_HEAD && \\
     mkdir -p build && cd build && \\
     PYBIND11_DIR="$(python3 -m pybind11 --cmakedir 2>/dev/null)"; if [ -n "$PYBIND11_DIR" ]; then CC_ARGS="$CC_ARGS -Dpybind11_DIR=$PYBIND11_DIR"; fi && \\
-    cmake -G Ninja .. -DCMAKE_BUILD_TYPE=Release -DBUILD_FAT_LIBROCKCOMPILER=On -DLLVM_INCLUDE_TESTS=Off $CC_ARGS 2>&1 | tee /tmp/rocmlir_cmake.log && \\
+    cmake -G Ninja .. -DCMAKE_BUILD_TYPE=Release -DBUILD_FAT_LIBROCKCOMPILER=On -DLLVM_INCLUDE_TESTS=Off -DMLIR_ENABLE_ROCM_RUNNER=Off -DMLIR_INCLUDE_TESTS=Off -DLLVM_TARGETS_TO_BUILD='X86;AMDGPU' -DLLVM_ENABLE_WERROR=OFF -DCMAKE_CXX_FLAGS=-Wno-error=deprecated-declarations $CC_ARGS 2>&1 | tee /tmp/rocmlir_cmake.log && \\
     ninja 2>&1 | tee /tmp/rocmlir_build.log && \\
     cmake --install . --prefix /opt/rocmlir && \\
-    find /opt/rocmlir -name 'rocMLIRConfig.cmake' -o -name 'rocmlir-config.cmake' | tee /tmp/rocmlir_cmake_files.txt && \\
+    find /opt/rocmlir -iname 'rocmlir*config*.cmake' | tee /tmp/rocmlir_cmake_files.txt && \\
     if [ ! -s /tmp/rocmlir_cmake_files.txt ]; then \\
         echo "ERROR: rocMLIR CMake package config not found under /opt/rocmlir after install; find_package(rocMLIR) will fail in the MIGraphX build."; \\
         exit 1; \\
@@ -350,9 +357,13 @@ RUN pip3 install --no-cache-dir ninja pybind11 && \\
 #
 # Build MIGraphX from source, reusing the prebuilt rocMLIR above.
 #
-# The ROCm/rocMLIR@<sha> line is stripped from requirements.txt so rbuild does
-# NOT rebuild LLVM/MLIR; MIGraphX's find_package(rocMLIR) is instead pointed at
-# the prebuilt /opt/rocmlir via rocMLIR_DIR (+ CMAKE_PREFIX_PATH).
+# The ROCm/rocMLIR@<sha> AND ROCm/rocmlirTriton@<sha> lines are stripped from
+# requirements.txt so rbuild does NOT rebuild LLVM/MLIR inline; MIGraphX's
+# find_package(rocMLIR) is instead pointed at the prebuilt /opt/rocmlir via
+# rocMLIR_DIR (+ CMAKE_PREFIX_PATH). The use_rocmlirtriton branch pins the
+# ROCm/rocmlirTriton fork, so ROCMLIR_REPO/ROCMLIR_COMMIT (build.py
+# --rocmlir-repo/--rocmlir-commit) must point at that fork for the prebuilt
+# artifact to match.
 #
 ARG MIGRAPHX_REPO={}
 ARG MIGRAPHX_BRANCH={}
@@ -363,14 +374,15 @@ RUN pip3 install --no-cache-dir wheel build && \\
     git clone ${{MIGRAPHX_REPO}} --recursive -b ${{MIGRAPHX_BRANCH}} migraphx_src && \\
     cd migraphx_src && \\
     pip3 install --no-cache-dir https://github.com/RadeonOpenCompute/rbuild/archive/master.tar.gz && \\
-    EXPECTED_MLIR=$(grep -oiE 'rocMLIR@[0-9a-f]+' requirements.txt | head -1 | cut -d@ -f2) && \\
+    EXPECTED_MLIR=$(grep -oiE 'roc(MLIR|mlirTriton)@[0-9a-f]+' requirements.txt | head -1 | cut -d@ -f2) && \\
     if [ -n "$EXPECTED_MLIR" ] && [ "$EXPECTED_MLIR" != "${{ROCMLIR_COMMIT}}" ]; then \\
         echo "WARNING: prebuilt rocMLIR ${{ROCMLIR_COMMIT}} != MIGraphX requirements.txt pin $EXPECTED_MLIR; rebuild rocMLIR at the matching commit (set --rocmlir-commit) to avoid an ABI mismatch."; \\
     fi && \\
-    sed -i '/rocMLIR/d' requirements.txt && \\
-    ROCMLIR_CFG=$(find /opt/rocmlir -name 'rocMLIRConfig.cmake' -o -name 'rocmlir-config.cmake' 2>/dev/null | head -1) && \\
+    sed -i -E '/roc(MLIR|mlirTriton)/d' requirements.txt && \\
+    ROCMLIR_CFG=$(find /opt/rocmlir -iname 'rocmlir*config*.cmake' 2>/dev/null | head -1) && \\
     if [ -z "$ROCMLIR_CFG" ]; then echo "ERROR: prebuilt rocMLIR not found under /opt/rocmlir; the rocMLIR build stage must run first."; exit 1; fi && \\
     export CMAKE_PREFIX_PATH="/opt/rocmlir:${{CMAKE_PREFIX_PATH:-}}" && \\
+    CXXFLAGS="-Wno-error=deprecated-declarations" \\
     rbuild build -d depend -B build -DMIGRAPHX_ENABLE_PYTHON=OFF -DGPU_TARGETS=gfx942 \\
         -DMIGRAPHX_PACKAGE_BACKEND=default -DrocMLIR_DIR="$(dirname $ROCMLIR_CFG)" 2>&1 | tee migraphx_build.log && \\
     cd build && \\
@@ -1086,7 +1098,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--migraphx-ep-branch",
         type=str,
-        default="reduce_compute_io_overhead",
+        default="main",
         help="MIGraphX plugin EP (onnxruntime-ep-amdgpu) git branch for "
         "build-from-source.",
     )

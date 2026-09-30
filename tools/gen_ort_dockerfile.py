@@ -322,8 +322,8 @@ RUN (command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y --
 # keyed only by ROCMLIR_REPO/ROCMLIR_COMMIT -- decouples the LLVM/MLIR build from
 # the (frequently-changing) MIGraphX and plugin-EP source: changing
 # MIGRAPHX_BRANCH or the EP no longer triggers an LLVM rebuild. ROCMLIR_COMMIT
-# MUST match the ROCm/rocMLIR@<sha> (or ROCm/rocmlirTriton@<sha>) pin in MIGraphX's
-# requirements.txt for ABI compatibility; bump it to force a rebuild.
+# must be the ROCm/rocmlirTriton@<ref> pin in AMDMIGraphX requirements.txt, or a
+# commit on that ref (release/rocm-rel-10.1). Bump the commit to force a rebuild.
 #
 # NOTE: this LLVM/MLIR tree predates the C++17 removal of std::get_temporary_buffer,
 # which GCC 12's libstdc++ (Debian 12 base image) marks [[deprecated]]. The build is
@@ -357,13 +357,13 @@ RUN pip3 install --no-cache-dir ninja pybind11 && \\
 #
 # Build MIGraphX from source, reusing the prebuilt rocMLIR above.
 #
-# The ROCm/rocMLIR@<sha> AND ROCm/rocmlirTriton@<sha> lines are stripped from
+# The ROCm/rocMLIR and ROCm/rocmlirTriton lines are stripped from
 # requirements.txt so rbuild does NOT rebuild LLVM/MLIR inline; MIGraphX's
 # find_package(rocMLIR) is instead pointed at the prebuilt /opt/rocmlir via
-# rocMLIR_DIR (+ CMAKE_PREFIX_PATH). The use_rocmlirtriton branch pins the
-# ROCm/rocmlirTriton fork, so ROCMLIR_REPO/ROCMLIR_COMMIT (build.py
-# --rocmlir-repo/--rocmlir-commit) must point at that fork for the prebuilt
-# artifact to match.
+# rocMLIR_DIR (+ CMAKE_PREFIX_PATH). AMDMIGraphX release/rocm-rel-10.1 pins
+# ROCm/rocmlirTriton, so ROCMLIR_REPO/ROCMLIR_COMMIT (build.py
+# --rocmlir-repo/--rocmlir-commit) must select that repo and a commit on the
+# pinned ref.
 #
 ARG MIGRAPHX_REPO={}
 ARG MIGRAPHX_BRANCH={}
@@ -374,10 +374,31 @@ RUN pip3 install --no-cache-dir wheel build && \\
     git clone ${{MIGRAPHX_REPO}} --recursive -b ${{MIGRAPHX_BRANCH}} migraphx_src && \\
     cd migraphx_src && \\
     pip3 install --no-cache-dir https://github.com/RadeonOpenCompute/rbuild/archive/master.tar.gz && \\
-    EXPECTED_MLIR=$(grep -oiE 'roc(MLIR|mlirTriton)@[0-9a-f]+' requirements.txt | head -1 | cut -d@ -f2) && \\
-    if [ -n "$EXPECTED_MLIR" ] && [ "$EXPECTED_MLIR" != "${{ROCMLIR_COMMIT}}" ]; then \\
-        echo "WARNING: prebuilt rocMLIR ${{ROCMLIR_COMMIT}} != MIGraphX requirements.txt pin $EXPECTED_MLIR; rebuild rocMLIR at the matching commit (set --rocmlir-commit) to avoid an ABI mismatch."; \\
-    fi && \\
+    EXPECTED_MLIR=$(grep -oiE 'roc(MLIR|mlirTriton)@[^[:space:]]+' requirements.txt | head -1 | cut -d@ -f2) && \\
+    if [ -n "$EXPECTED_MLIR" ]; then \\
+        case "$EXPECTED_MLIR" in \\
+            *[!0-9a-fA-F]*) \\
+                PIN_TIP=$(git ls-remote "${{ROCMLIR_REPO}}" "refs/heads/$EXPECTED_MLIR" "refs/tags/$EXPECTED_MLIR" | awk 'NR==1 {{print $1}}') && \\
+                if [ -z "$PIN_TIP" ]; then \\
+                    echo "WARNING: MIGraphX requirements.txt pins rocmlirTriton@$EXPECTED_MLIR, but that ref was not found in ${{ROCMLIR_REPO}}."; \\
+                elif [ "$PIN_TIP" != "${{ROCMLIR_COMMIT}}" ]; then \\
+                    rm -rf /tmp/rocmlir_pin_check && \\
+                    git init /tmp/rocmlir_pin_check && \\
+                    git -C /tmp/rocmlir_pin_check remote add origin "${{ROCMLIR_REPO}}" && \\
+                    if git -C /tmp/rocmlir_pin_check fetch --filter=blob:none origin "$EXPECTED_MLIR" && \\
+                       git -C /tmp/rocmlir_pin_check merge-base --is-ancestor "${{ROCMLIR_COMMIT}}" FETCH_HEAD; then \\
+                        :; \\
+                    else \\
+                        echo "WARNING: prebuilt rocmlirTriton ${{ROCMLIR_COMMIT}} is not on MIGraphX requirements.txt pin $EXPECTED_MLIR ($PIN_TIP). Set --rocmlir-commit to a commit on that ref."; \\
+                    fi && \\
+                    rm -rf /tmp/rocmlir_pin_check; \\
+                fi ;; \\
+            *) \\
+                if [ "$EXPECTED_MLIR" != "${{ROCMLIR_COMMIT}}" ]; then \\
+                    echo "WARNING: prebuilt rocmlirTriton ${{ROCMLIR_COMMIT}} != MIGraphX requirements.txt pin $EXPECTED_MLIR; set --rocmlir-commit to that commit to avoid an ABI mismatch."; \\
+                fi ;; \\
+        esac; \\
+    fi || echo "WARNING: could not validate the rocmlirTriton pin in MIGraphX requirements.txt." && \\
     sed -i -E '/roc(MLIR|mlirTriton)/d' requirements.txt && \\
     ROCMLIR_CFG=$(find /opt/rocmlir -iname 'rocmlir*config*.cmake' 2>/dev/null | head -1) && \\
     if [ -z "$ROCMLIR_CFG" ]; then echo "ERROR: prebuilt rocMLIR not found under /opt/rocmlir; the rocMLIR build stage must run first."; exit 1; fi && \\
@@ -1045,7 +1066,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--migraphx-branch",
         type=str,
-        default="develop",
+        default="release/rocm-rel-10.1",
         help="MIGraphX git branch for build-from-source.",
     )
     parser.add_argument(
@@ -1068,7 +1089,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--migraphx-package-version",
         type=str,
-        default="2.17.0+rocm10.0.0",
+        default="2.18.0+rocm10.1.0",
         help="Version tag of the prebuilt amdrocm-migraphx packages (used when "
         "--migraphx-build-mode=package). Must match the base image ROCm train "
         "(e.g. 2.17.0 => rocm10.0.0) and Debian release (debian12).",
@@ -1076,17 +1097,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rocmlir-repo",
         type=str,
-        default="https://github.com/ROCm/rocMLIR.git",
-        help="rocMLIR git repo URL. rocMLIR (librockCompiler) is prebuilt once "
-        "into /opt/rocmlir and MIGraphX links it instead of rebuilding LLVM/MLIR "
-        "from source.",
+        default="https://github.com/ROCm/rocmlirTriton.git",
+        help="rocmlirTriton git repo URL. rocmlirTriton (librockCompiler) is "
+        "prebuilt once into /opt/rocmlir and MIGraphX links it instead of "
+        "rebuilding LLVM/MLIR from source. AMDMIGraphX release/rocm-rel-10.1 "
+        "pins ROCm/rocmlirTriton in requirements.txt.",
     )
     parser.add_argument(
         "--rocmlir-commit",
         type=str,
-        default="2e1e7abf4ec789e74e49e42018f852ea66e5ef85",
-        help="rocMLIR git commit to prebuild. MUST match the ROCm/rocMLIR@<sha> "
-        "entry in MIGraphX's requirements.txt for ABI compatibility.",
+        default="f347064fea12aa0ab325e1244b65766652a2530c",
+        help="rocmlirTriton git commit to prebuild. Freeze a commit from the "
+        "ROCm/rocmlirTriton ref named in AMDMIGraphX requirements.txt "
+        "(release/rocm-rel-10.1). A branch name is accepted by git fetch, but "
+        "it will not invalidate the Docker layer when that branch moves.",
     )
     parser.add_argument(
         "--migraphx-ep-repo",

@@ -1066,7 +1066,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--migraphx-branch",
         type=str,
-        default="release/rocm-rel-10.1",
+        default="remove_output_concats2",
         help="MIGraphX git branch for build-from-source.",
     )
     parser.add_argument(
@@ -1122,7 +1122,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--migraphx-ep-branch",
         type=str,
-        default="main",
+        default="cleanup_pad_slice_overhead",
         help="MIGraphX plugin EP (onnxruntime-ep-amdgpu) git branch for "
         "build-from-source.",
     )

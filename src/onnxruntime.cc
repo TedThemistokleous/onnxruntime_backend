@@ -1553,6 +1553,10 @@ class ModelInstanceState : public BackendModelInstance {
       std::vector<TRITONBACKEND_Response*>* responses,
       BackendInputCollector* collector, std::vector<const char*>* input_names,
       bool* cuda_copy);
+  TRITONSERVER_Error* InitPersistentInputBinding();
+  TRITONSERVER_Error* SetInputTensorsPersistent(
+      size_t total_batch_size, BackendInputCollector* collector,
+      std::vector<const char*>* input_names, bool* cuda_copy);
   TRITONSERVER_Error* SetStringInputTensor(
       TRITONBACKEND_Request** requests, const uint32_t request_count,
       std::vector<TRITONBACKEND_Response*>* responses, const char* input_name,
@@ -1600,7 +1604,10 @@ class ModelInstanceState : public BackendModelInstance {
   OrtAllocator* default_allocator_;
   OrtMemoryInfo* cuda_allocator_info_;
   const OrtMemoryInfo* cpu_allocator_info_;
+  // Binding for the current run. Non-owning: points at 'transient_binding_'
+  // or at a 'persistent_bindings_' entry.
   OrtIoBinding* io_binding_;
+  OrtIoBinding* transient_binding_{nullptr};
   OrtRunOptions* runOptions_;
   // map of output name -> bound mem type and id
   std::unordered_map<std::string, std::pair<TRITONSERVER_MemoryType, int64_t>>
@@ -1613,6 +1620,29 @@ class ModelInstanceState : public BackendModelInstance {
 
   // A map from scalar output tensors to the dimension specified in model config
   std::unordered_map<std::string, std::vector<int64_t>> scalar_outputs_;
+
+  // Persistent input binding. Eligible models gather into instance-owned
+  // buffers and keep their OrtValues and IoBinding alive across runs, so the
+  // steady-state cost of an input is one collector gather and nothing else.
+  struct InputStaging {
+    BackendMemory* memory{nullptr};
+    char* base{nullptr};
+    size_t row_bytes{0};
+    TRITONSERVER_MemoryType memory_type{TRITONSERVER_MEMORY_CPU};
+    int64_t memory_type_id{0};
+  };
+
+  // The OrtValue shape bakes in the batch dimension, so a binding is only
+  // reusable for the batch size it was built at.
+  struct PersistentBinding {
+    OrtIoBinding* binding{nullptr};
+    std::vector<OrtValue*> input_tensors;
+  };
+
+  bool use_persistent_input_binding_{false};
+  std::vector<std::string> persistent_input_order_;
+  std::unordered_map<std::string, InputStaging> input_staging_;
+  std::unordered_map<size_t, PersistentBinding> persistent_bindings_;
 
   // Onnx Runtime variables that will be reset and used for every run
   // on this instance.
@@ -1670,7 +1700,8 @@ ModelInstanceState::ModelInstanceState(
       ort_api->AllocatorGetInfo(default_allocator_, &cpu_allocator_info_));
 
   THROW_IF_BACKEND_INSTANCE_ORT_ERROR(
-      ort_api->CreateIoBinding(session_, &io_binding_));
+      ort_api->CreateIoBinding(session_, &transient_binding_));
+  io_binding_ = transient_binding_;
 
   THROW_IF_BACKEND_INSTANCE_ORT_ERROR(ort_api->CreateRunOptions(&runOptions_));
 
@@ -1761,13 +1792,25 @@ ModelInstanceState::ModelInstanceState(
 
   THROW_IF_BACKEND_INSTANCE_ERROR(ValidateInputs(expected_input_cnt));
   THROW_IF_BACKEND_INSTANCE_ERROR(ValidateOutputs());
+  THROW_IF_BACKEND_INSTANCE_ERROR(InitPersistentInputBinding());
 }
 
 ModelInstanceState::~ModelInstanceState()
 {
   ReleaseOrtRunResources();
   ort_api->ReleaseRunOptions(runOptions_);
-  ort_api->ReleaseIoBinding(io_binding_);
+  for (auto& binding_pair : persistent_bindings_) {
+    for (auto* tensor : binding_pair.second.input_tensors) {
+      if (tensor != nullptr) {
+        ort_api->ReleaseValue(tensor);
+      }
+    }
+    ort_api->ReleaseIoBinding(binding_pair.second.binding);
+  }
+  for (auto& staging_pair : input_staging_) {
+    delete staging_pair.second.memory;
+  }
+  ort_api->ReleaseIoBinding(transient_binding_);
   ort_api->ReleaseMemoryInfo(cuda_allocator_info_);
   if (session_ != nullptr) {
     OnnxLoader::UnloadSession(session_);
@@ -1779,15 +1822,18 @@ ModelInstanceState::~ModelInstanceState()
 void
 ModelInstanceState::ReleaseOrtRunResources()
 {
-  ort_api->ClearBoundInputs(io_binding_);
-  for (auto& tensor : input_tensors_) {
-    if (tensor != nullptr) {
-      ort_api->ReleaseValue(tensor);
+  // Persistent inputs stay bound to pointer-stable staging across runs.
+  if (!use_persistent_input_binding_) {
+    ort_api->ClearBoundInputs(io_binding_);
+    for (auto& tensor : input_tensors_) {
+      if (tensor != nullptr) {
+        ort_api->ReleaseValue(tensor);
+      }
     }
+    input_tensors_.clear();
   }
-  input_tensors_.clear();
 
-  // first release the Ortvalues
+  // Outputs are allocated by ORT on every run, so always release them.
   ort_api->ClearBoundOutputs(io_binding_);
   for (auto& tensor : output_tensors_) {
     if (tensor != nullptr) {
@@ -2496,6 +2542,146 @@ ModelInstanceState::OrtRun(
 }
 
 TRITONSERVER_Error*
+ModelInstanceState::InitPersistentInputBinding()
+{
+  use_persistent_input_binding_ = false;
+
+  // Needs a batch dimension to key bindings on, and every input must be
+  // present in every request with a row size known at init.
+  if (model_state_->MaxBatchSize() <= 0) {
+    return nullptr;
+  }
+  if (!StateForModel()->BatchInputs().empty()) {
+    return nullptr;
+  }
+  triton::common::TritonJson::Value sequence_batching;
+  if (model_state_->ModelConfig().Find(
+          "sequence_batching", &sequence_batching)) {
+    return nullptr;
+  }
+
+  // Drive off the config input list, not input_tensor_infos_: the latter also
+  // holds overridable initializers, which are not sent per request.
+  triton::common::TritonJson::Value ios;
+  RETURN_IF_ERROR(model_state_->ModelConfig().MemberAsArray("input", &ios));
+
+  std::vector<std::string> names;
+  for (size_t i = 0; i < ios.ArraySize(); i++) {
+    triton::common::TritonJson::Value io;
+    RETURN_IF_ERROR(ios.IndexAsObject(i, &io));
+    std::string io_name;
+    RETURN_IF_ERROR(io.MemberAsString("name", &io_name));
+    bool io_optional = false;
+    RETURN_IF_ERROR(io.MemberAsBool("optional", &io_optional));
+    if (io_optional || StateForModel()->IsInputRagged(io_name)) {
+      return nullptr;
+    }
+
+    auto iti = input_tensor_infos_.find(io_name);
+    if (iti == input_tensor_infos_.end()) {
+      return nullptr;
+    }
+    const auto& info = iti->second;
+    if (info.type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING ||
+        info.dims_.empty()) {
+      return nullptr;
+    }
+    for (size_t d = 1; d < info.dims_.size(); d++) {
+      if (info.dims_[d] < 0) {
+        return nullptr;
+      }
+    }
+    names.push_back(io_name);
+  }
+  if (names.empty()) {
+    return nullptr;
+  }
+
+  const size_t max_batch = static_cast<size_t>(model_state_->MaxBatchSize());
+  for (const auto& name : names) {
+    const auto& info = input_tensor_infos_.find(name)->second;
+    int64_t row_elems = 1;
+    for (size_t i = 1; i < info.dims_.size(); i++) {
+      row_elems *= info.dims_[i];
+    }
+
+    InputStaging stg;
+    stg.row_bytes = row_elems * TRITONSERVER_DataTypeByteSize(
+                                    ConvertFromOnnxDataType(info.type_));
+    RETURN_IF_ERROR(BackendMemory::Create(
+        model_state_->TritonMemoryManager(),
+        {BackendMemory::AllocationType::CPU_PINNED_POOL,
+         BackendMemory::AllocationType::CPU},
+        0 /* memory_type_id */, stg.row_bytes * max_batch, &stg.memory));
+    stg.base = stg.memory->MemoryPtr();
+    stg.memory_type = stg.memory->MemoryType();
+    stg.memory_type_id = stg.memory->MemoryTypeId();
+
+    input_staging_[name] = stg;
+    persistent_input_order_.push_back(name);
+  }
+
+  use_persistent_input_binding_ = true;
+  LOG_MESSAGE(
+      TRITONSERVER_LOG_INFO,
+      (std::string("persistent input binding enabled for ") +
+       std::to_string(persistent_input_order_.size()) +
+       " inputs at max batch " + std::to_string(max_batch))
+          .c_str());
+  return nullptr;
+}
+
+TRITONSERVER_Error*
+ModelInstanceState::SetInputTensorsPersistent(
+    size_t total_batch_size, BackendInputCollector* collector,
+    std::vector<const char*>* input_names, bool* cuda_copy)
+{
+  auto& entry = persistent_bindings_[total_batch_size];
+  const bool build = (entry.binding == nullptr);
+  if (build) {
+    RETURN_IF_ORT_ERROR(ort_api->CreateIoBinding(session_, &entry.binding));
+    entry.input_tensors.reserve(persistent_input_order_.size());
+  }
+  io_binding_ = entry.binding;
+
+  for (const auto& name : persistent_input_order_) {
+    auto& stg = input_staging_[name];
+    const auto& info = input_tensor_infos_.find(name)->second;
+    const size_t batchn_byte_size = stg.row_bytes * total_batch_size;
+
+    // Gather into our buffer rather than one the collector allocates: the
+    // stable data pointer is what lets the OrtValue and binding outlive the run.
+    const char* dst = nullptr;
+    size_t dst_bytes = 0;
+    TRITONSERVER_MemoryType dst_type;
+    int64_t dst_type_id;
+    RETURN_IF_ERROR(collector->ProcessTensor(
+        name.c_str(), stg.base, batchn_byte_size,
+        {{stg.memory_type, stg.memory_type_id}}, &dst, &dst_bytes, &dst_type,
+        &dst_type_id));
+    RETURN_ERROR_IF_TRUE(
+        dst != stg.base, TRITONSERVER_ERROR_INTERNAL,
+        std::string("input '") + name +
+            "' was not gathered into its persistent staging buffer");
+
+    if (build) {
+      std::vector<int64_t> batchn_shape(info.dims_.begin(), info.dims_.end());
+      batchn_shape[0] = static_cast<int64_t>(total_batch_size);
+      entry.input_tensors.emplace_back(nullptr);
+      RETURN_IF_ORT_ERROR(ort_api->CreateTensorWithDataAsOrtValue(
+          cpu_allocator_info_, stg.base, batchn_byte_size, batchn_shape.data(),
+          batchn_shape.size(), info.type_, &entry.input_tensors.back()));
+      RETURN_IF_ORT_ERROR(ort_api->BindInput(
+          entry.binding, name.c_str(), entry.input_tensors.back()));
+    }
+    input_names->emplace_back(name.c_str());
+  }
+
+  *cuda_copy |= collector->Finalize();
+  return nullptr;
+}
+
+TRITONSERVER_Error*
 ModelInstanceState::SetInputTensors(
     size_t total_batch_size, TRITONBACKEND_Request** requests,
     const uint32_t request_count,
@@ -2503,6 +2689,12 @@ ModelInstanceState::SetInputTensors(
     BackendInputCollector* collector, std::vector<const char*>* input_names,
     bool* cuda_copy)
 {
+  if (use_persistent_input_binding_) {
+    return SetInputTensorsPersistent(
+        total_batch_size, collector, input_names, cuda_copy);
+  }
+  io_binding_ = transient_binding_;
+
   const int max_batch_size = model_state_->MaxBatchSize();
 
   // When ORT_MIGRAPHX_INPUTS_ON_HOST is set, keep inputs host-resident (pinned)

@@ -1737,10 +1737,15 @@ class ModelInstanceState : public BackendModelInstance {
   // Persistent input binding. Eligible models gather into instance-owned
   // buffers and keep their OrtValues and IoBinding alive across runs, so the
   // steady-state cost of an input is one collector gather and nothing else.
-  struct InputStaging {
+  // Everything the per-run loop needs for one input, resolved at load and
+  // never modified afterwards, so 'name.c_str()' stays valid for ORT.
+  struct PersistentInput {
+    std::string name;
+    std::vector<int64_t> dims;
+    ONNXTensorElementDataType type{ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED};
+    size_t row_bytes{0};
     BackendMemory* memory{nullptr};
     char* base{nullptr};
-    size_t row_bytes{0};
     TRITONSERVER_MemoryType memory_type{TRITONSERVER_MEMORY_CPU};
     int64_t memory_type_id{0};
   };
@@ -1753,8 +1758,7 @@ class ModelInstanceState : public BackendModelInstance {
   };
 
   bool use_persistent_input_binding_{false};
-  std::vector<std::string> persistent_input_order_;
-  std::unordered_map<std::string, InputStaging> input_staging_;
+  std::vector<PersistentInput> persistent_inputs_;
   std::unordered_map<size_t, PersistentBinding> persistent_bindings_;
 
   // Per-output metadata resolved once, so the per-run loops do no name
@@ -1949,8 +1953,8 @@ ModelInstanceState::~ModelInstanceState()
     }
     ort_api->ReleaseIoBinding(binding_pair.second.binding);
   }
-  for (auto& staging_pair : input_staging_) {
-    delete staging_pair.second.memory;
+  for (auto& pi : persistent_inputs_) {
+    delete pi.memory;
   }
   ort_api->ReleaseIoBinding(transient_binding_);
   ort_api->ReleaseMemoryInfo(cuda_allocator_info_);
@@ -2776,6 +2780,7 @@ ModelInstanceState::InitPersistentInputBinding()
   }
 
   const size_t max_batch = static_cast<size_t>(model_state_->MaxBatchSize());
+  persistent_inputs_.reserve(names.size());
   for (const auto& name : names) {
     const auto& info = input_tensor_infos_.find(name)->second;
     int64_t row_elems = 1;
@@ -2783,28 +2788,29 @@ ModelInstanceState::InitPersistentInputBinding()
       row_elems *= info.dims_[i];
     }
 
-    InputStaging stg;
-    stg.row_bytes = row_elems * TRITONSERVER_DataTypeByteSize(
-                                    ConvertFromOnnxDataType(info.type_));
+    persistent_inputs_.emplace_back();
+    PersistentInput& pi = persistent_inputs_.back();
+    pi.name = name;
+    pi.dims = info.dims_;
+    pi.type = info.type_;
+    pi.row_bytes = row_elems * TRITONSERVER_DataTypeByteSize(
+                                   ConvertFromOnnxDataType(info.type_));
     RETURN_IF_ERROR(BackendMemory::Create(
         model_state_->TritonMemoryManager(),
         {BackendMemory::AllocationType::CPU_PINNED_POOL,
          BackendMemory::AllocationType::CPU},
-        0 /* memory_type_id */, stg.row_bytes * max_batch, &stg.memory));
-    stg.base = stg.memory->MemoryPtr();
-    stg.memory_type = stg.memory->MemoryType();
-    stg.memory_type_id = stg.memory->MemoryTypeId();
-
-    input_staging_[name] = stg;
-    persistent_input_order_.push_back(name);
+        0 /* memory_type_id */, pi.row_bytes * max_batch, &pi.memory));
+    pi.base = pi.memory->MemoryPtr();
+    pi.memory_type = pi.memory->MemoryType();
+    pi.memory_type_id = pi.memory->MemoryTypeId();
   }
 
   use_persistent_input_binding_ = true;
   LOG_MESSAGE(
       TRITONSERVER_LOG_INFO,
       (std::string("persistent input binding enabled for ") +
-       std::to_string(persistent_input_order_.size()) +
-       " inputs at max batch " + std::to_string(max_batch))
+       std::to_string(persistent_inputs_.size()) + " inputs at max batch " +
+       std::to_string(max_batch))
           .c_str());
   return nullptr;
 }
@@ -2818,14 +2824,12 @@ ModelInstanceState::SetInputTensorsPersistent(
   const bool build = (entry.binding == nullptr);
   if (build) {
     RETURN_IF_ORT_ERROR(ort_api->CreateIoBinding(session_, &entry.binding));
-    entry.input_tensors.reserve(persistent_input_order_.size());
+    entry.input_tensors.reserve(persistent_inputs_.size());
   }
   io_binding_ = entry.binding;
 
-  for (const auto& name : persistent_input_order_) {
-    auto& stg = input_staging_[name];
-    const auto& info = input_tensor_infos_.find(name)->second;
-    const size_t batchn_byte_size = stg.row_bytes * total_batch_size;
+  for (const auto& pi : persistent_inputs_) {
+    const size_t batchn_byte_size = pi.row_bytes * total_batch_size;
 
     // Gather into our buffer rather than one the collector allocates: the
     // stable data pointer is what lets the OrtValue and binding outlive the run.
@@ -2834,25 +2838,25 @@ ModelInstanceState::SetInputTensorsPersistent(
     TRITONSERVER_MemoryType dst_type;
     int64_t dst_type_id;
     RETURN_IF_ERROR(collector->ProcessTensor(
-        name.c_str(), stg.base, batchn_byte_size,
-        {{stg.memory_type, stg.memory_type_id}}, &dst, &dst_bytes, &dst_type,
+        pi.name.c_str(), pi.base, batchn_byte_size,
+        {{pi.memory_type, pi.memory_type_id}}, &dst, &dst_bytes, &dst_type,
         &dst_type_id));
     RETURN_ERROR_IF_TRUE(
-        dst != stg.base, TRITONSERVER_ERROR_INTERNAL,
-        std::string("input '") + name +
+        dst != pi.base, TRITONSERVER_ERROR_INTERNAL,
+        std::string("input '") + pi.name +
             "' was not gathered into its persistent staging buffer");
 
     if (build) {
-      std::vector<int64_t> batchn_shape(info.dims_.begin(), info.dims_.end());
+      std::vector<int64_t> batchn_shape(pi.dims.begin(), pi.dims.end());
       batchn_shape[0] = static_cast<int64_t>(total_batch_size);
       entry.input_tensors.emplace_back(nullptr);
       RETURN_IF_ORT_ERROR(ort_api->CreateTensorWithDataAsOrtValue(
-          cpu_allocator_info_, stg.base, batchn_byte_size, batchn_shape.data(),
-          batchn_shape.size(), info.type_, &entry.input_tensors.back()));
+          cpu_allocator_info_, pi.base, batchn_byte_size, batchn_shape.data(),
+          batchn_shape.size(), pi.type, &entry.input_tensors.back()));
       RETURN_IF_ORT_ERROR(ort_api->BindInput(
-          entry.binding, name.c_str(), entry.input_tensors.back()));
+          entry.binding, pi.name.c_str(), entry.input_tensors.back()));
     }
-    input_names->emplace_back(name.c_str());
+    input_names->emplace_back(pi.name.c_str());
   }
 
   *cuda_copy |= collector->Finalize();

@@ -45,9 +45,13 @@
 
 #include <stdint.h>
 
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "onnxruntime_loader.h"
@@ -78,6 +82,78 @@ namespace triton { namespace backend { namespace onnxruntime {
 /// Deleter for OrtSession.
 struct SessionDeleter {
   void operator()(OrtSession* f) { OnnxLoader::UnloadSession(f); }
+};
+
+// Bounded queue served by its own worker threads. Push blocks while the queue
+// is full, so a slow consumer applies backpressure instead of growing memory.
+// Stop lets the workers finish everything already queued before they exit.
+template <typename T>
+class WorkQueue {
+ public:
+  ~WorkQueue() { Stop(); }
+
+  void Start(
+      size_t thread_count, size_t max_depth, std::function<void(T&)> fn)
+  {
+    max_depth_ = max_depth;
+    fn_ = std::move(fn);
+    for (size_t i = 0; i < thread_count; ++i) {
+      threads_.emplace_back([this] { Loop(); });
+    }
+  }
+
+  bool Running() const { return !threads_.empty(); }
+
+  void Push(T&& item)
+  {
+    {
+      std::unique_lock<std::mutex> lk(mu_);
+      space_cv_.wait(lk, [this] { return q_.size() < max_depth_; });
+      q_.push_back(std::move(item));
+    }
+    cv_.notify_one();
+  }
+
+  void Stop()
+  {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& thread : threads_) {
+      thread.join();
+    }
+    threads_.clear();
+  }
+
+ private:
+  void Loop()
+  {
+    for (;;) {
+      T item;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this] { return stop_ || !q_.empty(); });
+        if (q_.empty()) {
+          return;
+        }
+        item = std::move(q_.front());
+        q_.pop_front();
+      }
+      space_cv_.notify_one();
+      fn_(item);
+    }
+  }
+
+  std::function<void(T&)> fn_;
+  std::vector<std::thread> threads_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::condition_variable space_cv_;
+  std::deque<T> q_;
+  size_t max_depth_{1};
+  bool stop_{false};
 };
 
 // BackendConfiguration
@@ -1594,7 +1670,30 @@ class ModelInstanceState : public BackendModelInstance {
       const uint32_t request_count,
       std::vector<TRITONBACKEND_Response*>* responses, bool state);
 
+  // Per-request statistics and release for one execution. Triton's request
+  // array is only valid during Execute, so the request pointers are copied.
+  struct Completion {
+    std::vector<TRITONBACKEND_Request*> requests;
+    std::vector<uint8_t> success;
+    size_t total_batch_size{0};
+    bool batch_ok{false};
+    uint64_t exec_start_ns{0};
+    uint64_t compute_start_ns{0};
+    uint64_t compute_end_ns{0};
+    uint64_t exec_end_ns{0};
+  };
+  TRITONSERVER_Error* ReadThreadingParameters();
+  void StartBackgroundThreads();
+  void DispatchCompletion(Completion&& completion);
+  void FinishCompletion(Completion& completion);
+
   ModelState* model_state_;
+
+  // Background threads, all off by default. With 'completion_threads' set,
+  // statistics and request release run on that many workers instead of the
+  // instance thread.
+  int completion_thread_count_{0};
+  WorkQueue<Completion> completion_q_;
 
   // The full path to the ONNX model file.
   std::string model_path_;
@@ -1811,11 +1910,17 @@ ModelInstanceState::ModelInstanceState(
 
   THROW_IF_BACKEND_INSTANCE_ERROR(ValidateInputs(expected_input_cnt));
   THROW_IF_BACKEND_INSTANCE_ERROR(ValidateOutputs());
+  THROW_IF_BACKEND_INSTANCE_ERROR(ReadThreadingParameters());
   THROW_IF_BACKEND_INSTANCE_ERROR(InitPersistentInputBinding());
+  StartBackgroundThreads();
 }
 
 ModelInstanceState::~ModelInstanceState()
 {
+  // Workers drain their queues before exiting, so every queued request is
+  // still reported and released.
+  completion_q_.Stop();
+
   ReleaseOrtRunResources();
   ort_api->ReleaseRunOptions(runOptions_);
   for (auto& binding_pair : persistent_bindings_) {
@@ -1881,6 +1986,75 @@ ModelInstanceState::ReleaseOrtRunResources()
     delete mem;
   }
   input_tensor_memories_.clear();
+}
+
+TRITONSERVER_Error*
+ModelInstanceState::ReadThreadingParameters()
+{
+  triton::common::TritonJson::Value params;
+  if (model_state_->ModelConfig().Find("parameters", &params)) {
+    RETURN_IF_ERROR(TryParseModelStringParameter(
+        params, "completion_threads", &completion_thread_count_, 0));
+  }
+  RETURN_ERROR_IF_TRUE(
+      completion_thread_count_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
+      std::string("completion_threads must be >= 0"));
+  return nullptr;
+}
+
+void
+ModelInstanceState::StartBackgroundThreads()
+{
+  if (completion_thread_count_ > 0) {
+    completion_q_.Start(
+        completion_thread_count_, 4 /* max_depth */,
+        [this](Completion& completion) { FinishCompletion(completion); });
+  }
+
+  LOG_MESSAGE(
+      TRITONSERVER_LOG_INFO,
+      (std::string("completion threads: ") +
+       std::to_string(completion_thread_count_))
+          .c_str());
+}
+
+void
+ModelInstanceState::DispatchCompletion(Completion&& completion)
+{
+  if (completion_q_.Running()) {
+    completion_q_.Push(std::move(completion));
+  } else {
+    FinishCompletion(completion);
+  }
+}
+
+void
+ModelInstanceState::FinishCompletion(Completion& completion)
+{
+  for (size_t r = 0; r < completion.requests.size(); ++r) {
+    LOG_IF_ERROR(
+        TRITONBACKEND_ModelInstanceReportStatistics(
+            TritonModelInstance(), completion.requests[r],
+            completion.success[r] != 0, completion.exec_start_ns,
+            completion.compute_start_ns, completion.compute_end_ns,
+            completion.exec_end_ns),
+        "failed reporting request statistics");
+
+    LOG_IF_ERROR(
+        TRITONBACKEND_RequestRelease(
+            completion.requests[r], TRITONSERVER_REQUEST_RELEASE_ALL),
+        "failed releasing request");
+  }
+
+  if (completion.batch_ok) {
+    // Report the entire batch statistics.
+    LOG_IF_ERROR(
+        TRITONBACKEND_ModelInstanceReportBatchStatistics(
+            TritonModelInstance(), completion.total_batch_size,
+            completion.exec_start_ns, completion.compute_start_ns,
+            completion.compute_end_ns, completion.exec_end_ns),
+        "failed reporting batch request statistics");
+  }
 }
 
 TRITONSERVER_Error*
@@ -2466,29 +2640,20 @@ ModelInstanceState::ProcessRequests(
     }
   }
 
-  // Report statistics for each request.
-  for (uint32_t r = 0; r < request_count; ++r) {
-    auto& request = requests[r];
-    LOG_IF_ERROR(
-        TRITONBACKEND_ModelInstanceReportStatistics(
-            TritonModelInstance(), request,
-            (responses[r] != nullptr) /* success */, exec_start_ns,
-            compute_start_ns, compute_end_ns, exec_end_ns),
-        "failed reporting request statistics");
-
-    LOG_IF_ERROR(
-        TRITONBACKEND_RequestRelease(request, TRITONSERVER_REQUEST_RELEASE_ALL),
-        "failed releasing request");
+  // Report statistics for each request and release it.
+  Completion completion;
+  completion.requests.assign(requests, requests + request_count);
+  completion.success.reserve(request_count);
+  for (auto* response : responses) {
+    completion.success.push_back(response != nullptr);
   }
-
-  if (!all_response_failed) {
-    // Report the entire batch statistics.
-    LOG_IF_ERROR(
-        TRITONBACKEND_ModelInstanceReportBatchStatistics(
-            TritonModelInstance(), total_batch_size, exec_start_ns,
-            compute_start_ns, compute_end_ns, exec_end_ns),
-        "failed reporting batch request statistics");
-  }
+  completion.total_batch_size = total_batch_size;
+  completion.batch_ok = !all_response_failed;
+  completion.exec_start_ns = exec_start_ns;
+  completion.compute_start_ns = compute_start_ns;
+  completion.compute_end_ns = compute_end_ns;
+  completion.exec_end_ns = exec_end_ns;
+  DispatchCompletion(std::move(completion));
 }
 
 TRITONSERVER_Error*

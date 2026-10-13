@@ -47,6 +47,7 @@
 
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -1631,8 +1632,12 @@ class ModelInstanceState : public BackendModelInstance {
       bool* cuda_copy);
   TRITONSERVER_Error* InitPersistentInputBinding();
   TRITONSERVER_Error* SetInputTensorsPersistent(
-      size_t total_batch_size, BackendInputCollector* collector,
+      size_t total_batch_size, TRITONBACKEND_Request** requests,
+      const uint32_t request_count, BackendInputCollector* collector,
       std::vector<const char*>* input_names, bool* cuda_copy);
+  bool GatherPersistentInputsDirect(
+      TRITONBACKEND_Request** requests, const uint32_t request_count,
+      size_t total_batch_size);
   TRITONSERVER_Error* BuildOutputPlan(TRITONBACKEND_Request* request);
   TRITONSERVER_Error* SetStringInputTensor(
       TRITONBACKEND_Request** requests, const uint32_t request_count,
@@ -1760,6 +1765,17 @@ class ModelInstanceState : public BackendModelInstance {
   bool use_persistent_input_binding_{false};
   std::vector<PersistentInput> persistent_inputs_;
   std::unordered_map<size_t, PersistentBinding> persistent_bindings_;
+
+  // With 'direct_input_gather' set, persistent inputs are copied straight
+  // from the request buffers instead of through BackendInputCollector. Any
+  // case the direct path can't handle sends the whole execution back to the
+  // collector, which rewrites every staging row.
+  int direct_input_gather_{0};
+  bool direct_gather_warned_{false};
+  std::vector<size_t> gather_offsets_;
+  bool GatherInputRows(
+      const PersistentInput& pi, TRITONBACKEND_Request* request, char* base,
+      size_t capacity, size_t* offset);
 
   // Per-output metadata resolved once, so the per-run loops do no name
   // hashing and no repeated device-preference queries.
@@ -2019,6 +2035,8 @@ ModelInstanceState::ReadThreadingParameters()
         params, "completion_threads", &completion_thread_count_, 0));
     RETURN_IF_ERROR(TryParseModelStringParameter(
         params, "async_response_send", &async_response_send_, 0));
+    RETURN_IF_ERROR(TryParseModelStringParameter(
+        params, "direct_input_gather", &direct_input_gather_, 0));
   }
   RETURN_ERROR_IF_TRUE(
       completion_thread_count_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
@@ -2040,12 +2058,16 @@ ModelInstanceState::StartBackgroundThreads()
       SendAndComplete(batch);
     });
   }
+  if (!use_persistent_input_binding_) {
+    direct_input_gather_ = 0;
+  }
 
   LOG_MESSAGE(
       TRITONSERVER_LOG_INFO,
       (std::string("completion threads: ") +
        std::to_string(completion_thread_count_) +
-       ", async response send: " + (response_q_.Running() ? "on" : "off"))
+       ", async response send: " + (response_q_.Running() ? "on" : "off") +
+       ", direct input gather: " + (direct_input_gather_ ? "on" : "off"))
           .c_str());
 }
 
@@ -2817,7 +2839,8 @@ ModelInstanceState::InitPersistentInputBinding()
 
 TRITONSERVER_Error*
 ModelInstanceState::SetInputTensorsPersistent(
-    size_t total_batch_size, BackendInputCollector* collector,
+    size_t total_batch_size, TRITONBACKEND_Request** requests,
+    const uint32_t request_count, BackendInputCollector* collector,
     std::vector<const char*>* input_names, bool* cuda_copy)
 {
   auto& entry = persistent_bindings_[total_batch_size];
@@ -2828,23 +2851,40 @@ ModelInstanceState::SetInputTensorsPersistent(
   }
   io_binding_ = entry.binding;
 
+  bool gathered = false;
+  if (direct_input_gather_ != 0) {
+    gathered = GatherPersistentInputsDirect(
+        requests, request_count, total_batch_size);
+    if (!gathered && !direct_gather_warned_) {
+      direct_gather_warned_ = true;
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_WARN,
+          (std::string("direct input gather fell back to the input collector "
+                       "for '") +
+           Name() + "'; later fallbacks are not logged")
+              .c_str());
+    }
+  }
+
   for (const auto& pi : persistent_inputs_) {
     const size_t batchn_byte_size = pi.row_bytes * total_batch_size;
 
     // Gather into our buffer rather than one the collector allocates: the
     // stable data pointer is what lets the OrtValue and binding outlive the run.
-    const char* dst = nullptr;
-    size_t dst_bytes = 0;
-    TRITONSERVER_MemoryType dst_type;
-    int64_t dst_type_id;
-    RETURN_IF_ERROR(collector->ProcessTensor(
-        pi.name.c_str(), pi.base, batchn_byte_size,
-        {{pi.memory_type, pi.memory_type_id}}, &dst, &dst_bytes, &dst_type,
-        &dst_type_id));
-    RETURN_ERROR_IF_TRUE(
-        dst != pi.base, TRITONSERVER_ERROR_INTERNAL,
-        std::string("input '") + pi.name +
-            "' was not gathered into its persistent staging buffer");
+    if (!gathered) {
+      const char* dst = nullptr;
+      size_t dst_bytes = 0;
+      TRITONSERVER_MemoryType dst_type;
+      int64_t dst_type_id;
+      RETURN_IF_ERROR(collector->ProcessTensor(
+          pi.name.c_str(), pi.base, batchn_byte_size,
+          {{pi.memory_type, pi.memory_type_id}}, &dst, &dst_bytes, &dst_type,
+          &dst_type_id));
+      RETURN_ERROR_IF_TRUE(
+          dst != pi.base, TRITONSERVER_ERROR_INTERNAL,
+          std::string("input '") + pi.name +
+              "' was not gathered into its persistent staging buffer");
+    }
 
     if (build) {
       std::vector<int64_t> batchn_shape(pi.dims.begin(), pi.dims.end());
@@ -2859,8 +2899,92 @@ ModelInstanceState::SetInputTensorsPersistent(
     input_names->emplace_back(pi.name.c_str());
   }
 
-  *cuda_copy |= collector->Finalize();
+  if (!gathered) {
+    *cuda_copy |= collector->Finalize();
+  }
   return nullptr;
+}
+
+bool
+ModelInstanceState::GatherPersistentInputsDirect(
+    TRITONBACKEND_Request** requests, const uint32_t request_count,
+    size_t total_batch_size)
+{
+  // Request by request: each request's inputs sit together in its own
+  // buffers, so this keeps the reads local.
+  gather_offsets_.assign(persistent_inputs_.size(), 0);
+  for (uint32_t r = 0; r < request_count; ++r) {
+    for (size_t i = 0; i < persistent_inputs_.size(); ++i) {
+      const PersistentInput& pi = persistent_inputs_[i];
+      if (!GatherInputRows(
+              pi, requests[r], pi.base, pi.row_bytes * total_batch_size,
+              &gather_offsets_[i])) {
+        return false;
+      }
+    }
+  }
+  for (size_t i = 0; i < persistent_inputs_.size(); ++i) {
+    if (gather_offsets_[i] !=
+        persistent_inputs_[i].row_bytes * total_batch_size) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool
+ModelInstanceState::GatherInputRows(
+    const PersistentInput& pi, TRITONBACKEND_Request* request, char* base,
+    size_t capacity, size_t* offset)
+{
+  const char* host_policy = HostPolicyName().c_str();
+  TRITONBACKEND_Input* input;
+  const int64_t* shape;
+  uint32_t dims_count;
+  uint64_t byte_size;
+  uint32_t buffer_count;
+  TRITONSERVER_Error* err =
+      TRITONBACKEND_RequestInput(request, pi.name.c_str(), &input);
+  if (err == nullptr) {
+    err = TRITONBACKEND_InputPropertiesForHostPolicy(
+        input, host_policy, nullptr, nullptr, &shape, &dims_count, &byte_size,
+        &buffer_count);
+  }
+  if (err != nullptr) {
+    TRITONSERVER_ErrorDelete(err);
+    return false;
+  }
+  if ((dims_count == 0) || (shape[0] < 0) ||
+      (byte_size != static_cast<uint64_t>(shape[0]) * pi.row_bytes) ||
+      (*offset + byte_size > capacity)) {
+    return false;
+  }
+
+  size_t copied = 0;
+  for (uint32_t b = 0; b < buffer_count; ++b) {
+    const void* src;
+    uint64_t src_bytes;
+    TRITONSERVER_MemoryType memory_type = TRITONSERVER_MEMORY_CPU;
+    int64_t memory_type_id = 0;
+    err = TRITONBACKEND_InputBufferForHostPolicy(
+        input, host_policy, b, &src, &src_bytes, &memory_type,
+        &memory_type_id);
+    if (err != nullptr) {
+      TRITONSERVER_ErrorDelete(err);
+      return false;
+    }
+    if ((memory_type == TRITONSERVER_MEMORY_GPU) ||
+        (copied + src_bytes > byte_size)) {
+      return false;
+    }
+    std::memcpy(base + *offset + copied, src, src_bytes);
+    copied += src_bytes;
+  }
+  if (copied != byte_size) {
+    return false;
+  }
+  *offset += byte_size;
+  return true;
 }
 
 TRITONSERVER_Error*
@@ -2951,7 +3075,8 @@ ModelInstanceState::SetInputTensors(
 {
   if (use_persistent_input_binding_) {
     return SetInputTensorsPersistent(
-        total_batch_size, collector, input_names, cuda_copy);
+        total_batch_size, requests, request_count, collector, input_names,
+        cuda_copy);
   }
   io_binding_ = transient_binding_;
 

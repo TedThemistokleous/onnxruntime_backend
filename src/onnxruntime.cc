@@ -1682,8 +1682,20 @@ class ModelInstanceState : public BackendModelInstance {
     uint64_t compute_end_ns{0};
     uint64_t exec_end_ns{0};
   };
+  // An execution's responses plus the completion that must follow them.
+  struct ResponseBatch {
+    std::vector<TRITONBACKEND_Response*> responses;
+    Completion completion;
+  };
   TRITONSERVER_Error* ReadThreadingParameters();
   void StartBackgroundThreads();
+  void CompleteExecution(
+      TRITONBACKEND_Request** requests, const uint32_t request_count,
+      std::vector<TRITONBACKEND_Response*>&& responses,
+      size_t total_batch_size, bool all_response_failed,
+      uint64_t exec_start_ns, uint64_t compute_start_ns,
+      uint64_t compute_end_ns, uint64_t exec_end_ns);
+  void SendAndComplete(ResponseBatch& batch);
   void DispatchCompletion(Completion&& completion);
   void FinishCompletion(Completion& completion);
 
@@ -1691,9 +1703,13 @@ class ModelInstanceState : public BackendModelInstance {
 
   // Background threads, all off by default. With 'completion_threads' set,
   // statistics and request release run on that many workers instead of the
-  // instance thread.
+  // instance thread. With 'async_response_send' set, one sender thread sends
+  // the responses, in execution order, and then hands the batch on for
+  // completion.
   int completion_thread_count_{0};
+  int async_response_send_{0};
   WorkQueue<Completion> completion_q_;
+  WorkQueue<ResponseBatch> response_q_;
 
   // The full path to the ONNX model file.
   std::string model_path_;
@@ -1918,7 +1934,9 @@ ModelInstanceState::ModelInstanceState(
 ModelInstanceState::~ModelInstanceState()
 {
   // Workers drain their queues before exiting, so every queued request is
-  // still reported and released.
+  // still sent, reported and released. The sender feeds the completion
+  // workers, so it stops first.
+  response_q_.Stop();
   completion_q_.Stop();
 
   ReleaseOrtRunResources();
@@ -1995,6 +2013,8 @@ ModelInstanceState::ReadThreadingParameters()
   if (model_state_->ModelConfig().Find("parameters", &params)) {
     RETURN_IF_ERROR(TryParseModelStringParameter(
         params, "completion_threads", &completion_thread_count_, 0));
+    RETURN_IF_ERROR(TryParseModelStringParameter(
+        params, "async_response_send", &async_response_send_, 0));
   }
   RETURN_ERROR_IF_TRUE(
       completion_thread_count_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
@@ -2010,12 +2030,68 @@ ModelInstanceState::StartBackgroundThreads()
         completion_thread_count_, 4 /* max_depth */,
         [this](Completion& completion) { FinishCompletion(completion); });
   }
+  // Exactly one sender, so responses leave in the order the batches ran.
+  if (async_response_send_ != 0) {
+    response_q_.Start(1, 4 /* max_depth */, [this](ResponseBatch& batch) {
+      SendAndComplete(batch);
+    });
+  }
 
   LOG_MESSAGE(
       TRITONSERVER_LOG_INFO,
       (std::string("completion threads: ") +
-       std::to_string(completion_thread_count_))
+       std::to_string(completion_thread_count_) +
+       ", async response send: " + (response_q_.Running() ? "on" : "off"))
           .c_str());
+}
+
+void
+ModelInstanceState::CompleteExecution(
+    TRITONBACKEND_Request** requests, const uint32_t request_count,
+    std::vector<TRITONBACKEND_Response*>&& responses, size_t total_batch_size,
+    bool all_response_failed, uint64_t exec_start_ns,
+    uint64_t compute_start_ns, uint64_t compute_end_ns, uint64_t exec_end_ns)
+{
+  ResponseBatch batch;
+  Completion& completion = batch.completion;
+  completion.requests.assign(requests, requests + request_count);
+  completion.success.reserve(request_count);
+  for (auto* response : responses) {
+    completion.success.push_back(response != nullptr);
+  }
+  completion.total_batch_size = total_batch_size;
+  completion.batch_ok = !all_response_failed;
+  completion.exec_start_ns = exec_start_ns;
+  completion.compute_start_ns = compute_start_ns;
+  completion.compute_end_ns = compute_end_ns;
+  completion.exec_end_ns = exec_end_ns;
+  batch.responses = std::move(responses);
+
+  // ReadOutputTensors has already copied every output into the response
+  // buffers and synchronized, so the responses no longer depend on any
+  // per-run state and can be sent from another thread.
+  if (response_q_.Running()) {
+    response_q_.Push(std::move(batch));
+  } else {
+    SendAndComplete(batch);
+  }
+}
+
+void
+ModelInstanceState::SendAndComplete(ResponseBatch& batch)
+{
+  // Send all the responses that haven't already been sent because of
+  // an earlier error. The success flags were captured beforehand, so the
+  // completion still knows which requests succeeded.
+  for (auto& response : batch.responses) {
+    if (response != nullptr) {
+      LOG_IF_ERROR(
+          TRITONBACKEND_ResponseSend(
+              response, TRITONSERVER_RESPONSE_COMPLETE_FINAL, nullptr),
+          "failed to send onnxruntime backend response");
+    }
+  }
+  DispatchCompletion(std::move(batch.completion));
 }
 
 void
@@ -2627,33 +2703,10 @@ ModelInstanceState::ProcessRequests(
   uint64_t exec_end_ns = 0;
   SET_TIMESTAMP(exec_end_ns);
 
-  // Send all the responses that haven't already been sent because of
-  // an earlier error. Note that the responses are not set to nullptr
-  // here as we need that indication below to determine if the request
-  // we successful or not.
-  for (auto& response : responses) {
-    if (response != nullptr) {
-      LOG_IF_ERROR(
-          TRITONBACKEND_ResponseSend(
-              response, TRITONSERVER_RESPONSE_COMPLETE_FINAL, nullptr),
-          "failed to send onnxruntime backend response");
-    }
-  }
-
-  // Report statistics for each request and release it.
-  Completion completion;
-  completion.requests.assign(requests, requests + request_count);
-  completion.success.reserve(request_count);
-  for (auto* response : responses) {
-    completion.success.push_back(response != nullptr);
-  }
-  completion.total_batch_size = total_batch_size;
-  completion.batch_ok = !all_response_failed;
-  completion.exec_start_ns = exec_start_ns;
-  completion.compute_start_ns = compute_start_ns;
-  completion.compute_end_ns = compute_end_ns;
-  completion.exec_end_ns = exec_end_ns;
-  DispatchCompletion(std::move(completion));
+  CompleteExecution(
+      requests, request_count, std::move(responses), total_batch_size,
+      all_response_failed, exec_start_ns, compute_start_ns, compute_end_ns,
+      exec_end_ns);
 }
 
 TRITONSERVER_Error*

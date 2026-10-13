@@ -1792,6 +1792,7 @@ class ModelInstanceState : public BackendModelInstance {
     std::vector<TRITONBACKEND_Response*> responses;
   };
   size_t AcquireSlot();
+  void WaitForFreeSlot();
   void ReleaseSlot(size_t slot);
   void RunPipelined(RunJob& job);
   int pipeline_depth_{0};
@@ -2137,6 +2138,13 @@ ModelInstanceState::AcquireSlot()
   const size_t slot = free_slots_.back();
   free_slots_.pop_back();
   return slot;
+}
+
+void
+ModelInstanceState::WaitForFreeSlot()
+{
+  std::unique_lock<std::mutex> lk(slot_mu_);
+  slot_cv_.wait(lk, [this] { return !free_slots_.empty(); });
 }
 
 void
@@ -2867,6 +2875,9 @@ ModelInstanceState::ProcessRequests(
     job.requests.assign(requests, requests + request_count);
     job.responses = std::move(responses);
     runner_q_.Push(std::move(job));
+    // Triton forms the next batch when Execute returns, so return only once
+    // the runner can take it; until then requests keep joining the queue.
+    WaitForFreeSlot();
     return;
   }
 

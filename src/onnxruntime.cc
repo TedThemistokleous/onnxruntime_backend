@@ -45,6 +45,7 @@
 
 #include <stdint.h>
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -1777,6 +1778,29 @@ class ModelInstanceState : public BackendModelInstance {
   std::vector<std::unordered_map<size_t, PersistentBinding>>
       persistent_bindings_;
 
+  // With 'pipeline_depth' set, Execute gathers into a free staging slot,
+  // binds outputs and hands the batch to a runner thread, so the next batch
+  // can be gathered while this one runs. There are pipeline_depth + 1 slots.
+  // The runner alone touches ORT output state for a pipelined batch.
+  struct RunJob {
+    size_t slot{0};
+    OrtIoBinding* binding{nullptr};
+    size_t total_batch_size{0};
+    bool all_response_failed{false};
+    uint64_t exec_start_ns{0};
+    std::vector<TRITONBACKEND_Request*> requests;
+    std::vector<TRITONBACKEND_Response*> responses;
+  };
+  size_t AcquireSlot();
+  void ReleaseSlot(size_t slot);
+  void RunPipelined(RunJob& job);
+  int pipeline_depth_{0};
+  bool pipeline_{false};
+  std::mutex slot_mu_;
+  std::condition_variable slot_cv_;
+  std::vector<size_t> free_slots_;
+  WorkQueue<RunJob> runner_q_;
+
   // With 'direct_input_gather' set, persistent inputs are copied straight
   // from the request buffers instead of through BackendInputCollector. Any
   // case the direct path can't handle sends the whole execution back to the
@@ -1964,8 +1988,9 @@ ModelInstanceState::ModelInstanceState(
 ModelInstanceState::~ModelInstanceState()
 {
   // Workers drain their queues before exiting, so every queued request is
-  // still sent, reported and released. The sender feeds the completion
-  // workers, so it stops first.
+  // still run, sent, reported and released. Each stage feeds the next, so
+  // they stop in pipeline order.
+  runner_q_.Stop();
   response_q_.Stop();
   completion_q_.Stop();
 
@@ -2051,10 +2076,18 @@ ModelInstanceState::ReadThreadingParameters()
         params, "async_response_send", &async_response_send_, 0));
     RETURN_IF_ERROR(TryParseModelStringParameter(
         params, "direct_input_gather", &direct_input_gather_, 0));
+    RETURN_IF_ERROR(TryParseModelStringParameter(
+        params, "pipeline_depth", &pipeline_depth_, 0));
   }
   RETURN_ERROR_IF_TRUE(
       completion_thread_count_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
       std::string("completion_threads must be >= 0"));
+  RETURN_ERROR_IF_TRUE(
+      pipeline_depth_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
+      std::string("pipeline_depth must be >= 0"));
+  pipeline_depth_ = std::min(pipeline_depth_, 4);
+  // Read before InitPersistentInputBinding, which allocates the slots.
+  staging_slots_ = static_cast<size_t>(pipeline_depth_) + 1;
   return nullptr;
 }
 
@@ -2074,6 +2107,16 @@ ModelInstanceState::StartBackgroundThreads()
   }
   if (!use_persistent_input_binding_) {
     direct_input_gather_ = 0;
+    pipeline_depth_ = 0;
+  }
+  pipeline_ = (pipeline_depth_ > 0);
+  if (pipeline_) {
+    for (size_t slot = 0; slot < staging_slots_; ++slot) {
+      free_slots_.push_back(slot);
+    }
+    runner_q_.Start(
+        1, staging_slots_ /* max_depth */,
+        [this](RunJob& job) { RunPipelined(job); });
   }
 
   LOG_MESSAGE(
@@ -2081,8 +2124,92 @@ ModelInstanceState::StartBackgroundThreads()
       (std::string("completion threads: ") +
        std::to_string(completion_thread_count_) +
        ", async response send: " + (response_q_.Running() ? "on" : "off") +
-       ", direct input gather: " + (direct_input_gather_ ? "on" : "off"))
+       ", direct input gather: " + (direct_input_gather_ ? "on" : "off") +
+       ", pipeline depth: " + std::to_string(pipeline_depth_))
           .c_str());
+}
+
+size_t
+ModelInstanceState::AcquireSlot()
+{
+  std::unique_lock<std::mutex> lk(slot_mu_);
+  slot_cv_.wait(lk, [this] { return !free_slots_.empty(); });
+  const size_t slot = free_slots_.back();
+  free_slots_.pop_back();
+  return slot;
+}
+
+void
+ModelInstanceState::ReleaseSlot(size_t slot)
+{
+  {
+    std::lock_guard<std::mutex> lk(slot_mu_);
+    free_slots_.push_back(slot);
+  }
+  slot_cv_.notify_one();
+}
+
+void
+ModelInstanceState::RunPipelined(RunJob& job)
+{
+  // The current device is per thread, and this thread isn't Triton's.
+#ifdef TRITON_ENABLE_GPU
+  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    static_cast<void>(cudaSetDevice(DeviceId()));
+  }
+#endif  // TRITON_ENABLE_GPU
+#ifdef TRITON_ENABLE_ROCM
+  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    static_cast<void>(hipSetDevice(DeviceId()));
+  }
+#endif  // TRITON_ENABLE_ROCM
+
+  const uint32_t request_count = static_cast<uint32_t>(job.requests.size());
+
+  uint64_t compute_start_ns = 0;
+  SET_TIMESTAMP(compute_start_ns);
+
+  if (!job.all_response_failed) {
+    RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
+        job.responses, request_count, job.all_response_failed,
+        OrtRun(&job.responses, request_count, job.binding));
+  }
+
+  uint64_t compute_end_ns = 0;
+  SET_TIMESTAMP(compute_end_ns);
+
+  if (!job.all_response_failed) {
+    RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
+        job.responses, request_count, job.all_response_failed,
+        ReadOutputTensors(
+            job.total_batch_size, job.requests.data(), request_count,
+            &job.responses, job.binding));
+  }
+
+  ReleaseOrtRunResources(job.binding);
+
+  // The GPU may still be reading this slot's pinned inputs if nothing
+  // above waited on the stream; it must be done before the slot is reused.
+#ifdef TRITON_ENABLE_GPU
+  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    cudaStreamSynchronize(CudaStream());
+  }
+#endif  // TRITON_ENABLE_GPU
+#ifdef TRITON_ENABLE_ROCM
+  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    static_cast<void>(
+        hipStreamSynchronize(static_cast<hipStream_t>(CudaStream())));
+  }
+#endif  // TRITON_ENABLE_ROCM
+  ReleaseSlot(job.slot);
+
+  uint64_t exec_end_ns = 0;
+  SET_TIMESTAMP(exec_end_ns);
+
+  CompleteExecution(
+      job.requests.data(), request_count, std::move(job.responses),
+      job.total_batch_size, job.all_response_failed, job.exec_start_ns,
+      compute_start_ns, compute_end_ns, exec_end_ns);
 }
 
 void
@@ -2682,7 +2809,7 @@ ModelInstanceState::ProcessRequests(
     OrtIoBinding** binding_;
   } io_tensor_wrapper(this, &binding);
 
-  const size_t slot = 0;
+  const size_t slot = pipeline_ ? AcquireSlot() : 0;
   std::vector<const char*> input_names;
   bool cuda_copy = false;
   BackendInputCollector collector(
@@ -2725,6 +2852,23 @@ ModelInstanceState::ProcessRequests(
     static_cast<void>(hipStreamSynchronize(static_cast<hipStream_t>(CudaStream())));
   }
 #endif
+
+  if (pipeline_) {
+    // The runner takes the batch even if gathering failed: it owns the
+    // binding's outputs from here on, frees the slot and completes the
+    // requests on every path.
+    io_tensor_wrapper.ctx_ = nullptr;
+    RunJob job;
+    job.slot = slot;
+    job.binding = binding;
+    job.total_batch_size = total_batch_size;
+    job.all_response_failed = all_response_failed;
+    job.exec_start_ns = exec_start_ns;
+    job.requests.assign(requests, requests + request_count);
+    job.responses = std::move(responses);
+    runner_q_.Push(std::move(job));
+    return;
+  }
 
   uint64_t compute_start_ns = 0;
   SET_TIMESTAMP(compute_start_ns);

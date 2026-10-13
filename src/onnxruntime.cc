@@ -52,6 +52,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -155,6 +156,84 @@ class WorkQueue {
   std::condition_variable space_cv_;
   std::deque<T> q_;
   size_t max_depth_{1};
+  bool stop_{false};
+};
+
+// Runs a fixed number of parts per call: part 0 on the calling thread and
+// the rest on persistent workers that sleep between calls, so a call costs
+// one wake-up rather than an allocation or queue push per part.
+class ForkJoin {
+ public:
+  ~ForkJoin() { Stop(); }
+
+  void Start(size_t parts, std::function<void(size_t)> fn)
+  {
+    parts_ = std::max<size_t>(parts, 1);
+    fn_ = std::move(fn);
+    for (size_t part = 1; part < parts_; ++part) {
+      workers_.emplace_back([this, part] { Loop(part); });
+    }
+  }
+
+  void Run()
+  {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++generation_;
+      pending_ = parts_ - 1;
+    }
+    cv_.notify_all();
+    fn_(0);
+    std::unique_lock<std::mutex> lk(mu_);
+    done_cv_.wait(lk, [this] { return pending_ == 0; });
+  }
+
+  void Stop()
+  {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& worker : workers_) {
+      worker.join();
+    }
+    workers_.clear();
+  }
+
+ private:
+  void Loop(size_t part)
+  {
+    uint64_t seen = 0;
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return stop_ || generation_ != seen; });
+        if (stop_) {
+          return;
+        }
+        seen = generation_;
+      }
+      fn_(part);
+      bool last;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        last = (--pending_ == 0);
+      }
+      if (last) {
+        done_cv_.notify_one();
+      }
+    }
+  }
+
+  std::function<void(size_t)> fn_;
+  std::vector<std::thread> workers_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::condition_variable done_cv_;
+  size_t parts_{1};
+  uint64_t generation_{0};
+  size_t pending_{0};
   bool stop_{false};
 };
 
@@ -1808,10 +1887,23 @@ class ModelInstanceState : public BackendModelInstance {
   // collector, which rewrites every staging row.
   int direct_input_gather_{0};
   bool direct_gather_warned_{false};
-  std::vector<size_t> gather_offsets_;
   bool GatherInputRows(
       const PersistentInput& pi, TRITONBACKEND_Request* request, char* base,
       size_t capacity, size_t* offset);
+
+  // With 'gather_threads' > 1 the direct gather is split across threads.
+  // Each part owns a fixed set of inputs, assigned at load to balance bytes
+  // per row, and writes only those inputs' staging buffers and its own
+  // result flag, so the parts share no mutable state.
+  bool GatherPersistentInputs(size_t part);
+  int gather_thread_count_{1};
+  std::vector<std::vector<size_t>> gather_parts_;
+  std::vector<uint8_t> gather_part_ok_;
+  TRITONBACKEND_Request** gather_requests_{nullptr};
+  uint32_t gather_request_count_{0};
+  size_t gather_total_batch_size_{0};
+  size_t gather_slot_{0};
+  ForkJoin gather_fj_;
 
   // Per-output metadata resolved once, so the per-run loops do no name
   // hashing and no repeated device-preference queries.
@@ -1994,6 +2086,7 @@ ModelInstanceState::~ModelInstanceState()
   runner_q_.Stop();
   response_q_.Stop();
   completion_q_.Stop();
+  gather_fj_.Stop();
 
   ReleaseOrtRunResources(transient_binding_);
   ort_api->ReleaseRunOptions(runOptions_);
@@ -2079,10 +2172,15 @@ ModelInstanceState::ReadThreadingParameters()
         params, "direct_input_gather", &direct_input_gather_, 0));
     RETURN_IF_ERROR(TryParseModelStringParameter(
         params, "pipeline_depth", &pipeline_depth_, 0));
+    RETURN_IF_ERROR(TryParseModelStringParameter(
+        params, "gather_threads", &gather_thread_count_, 1));
   }
   RETURN_ERROR_IF_TRUE(
       completion_thread_count_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
       std::string("completion_threads must be >= 0"));
+  RETURN_ERROR_IF_TRUE(
+      gather_thread_count_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
+      std::string("gather_threads must be >= 0"));
   RETURN_ERROR_IF_TRUE(
       pipeline_depth_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
       std::string("pipeline_depth must be >= 0"));
@@ -2110,6 +2208,29 @@ ModelInstanceState::StartBackgroundThreads()
     direct_input_gather_ = 0;
     pipeline_depth_ = 0;
   }
+  if (direct_input_gather_ != 0) {
+    const size_t parts = std::max<size_t>(
+        1, std::min<size_t>(gather_thread_count_, persistent_inputs_.size()));
+    gather_thread_count_ = static_cast<int>(parts);
+
+    // Largest rows first, dealt round-robin, balances both the input count
+    // and the bytes each part copies.
+    std::vector<size_t> order(persistent_inputs_.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [this](size_t a, size_t b) {
+      return persistent_inputs_[a].row_bytes > persistent_inputs_[b].row_bytes;
+    });
+    gather_parts_.assign(parts, {});
+    for (size_t k = 0; k < order.size(); ++k) {
+      gather_parts_[k % parts].push_back(order[k]);
+    }
+    gather_part_ok_.assign(parts, 0);
+    gather_fj_.Start(parts, [this](size_t part) {
+      gather_part_ok_[part] = GatherPersistentInputs(part);
+    });
+  } else {
+    gather_thread_count_ = 1;
+  }
   pipeline_ = (pipeline_depth_ > 0);
   if (pipeline_) {
     for (size_t slot = 0; slot < staging_slots_; ++slot) {
@@ -2126,6 +2247,7 @@ ModelInstanceState::StartBackgroundThreads()
        std::to_string(completion_thread_count_) +
        ", async response send: " + (response_q_.Running() ? "on" : "off") +
        ", direct input gather: " + (direct_input_gather_ ? "on" : "off") +
+       ", gather threads: " + std::to_string(gather_thread_count_) +
        ", pipeline depth: " + std::to_string(pipeline_depth_))
           .c_str());
 }
@@ -3090,22 +3212,35 @@ ModelInstanceState::GatherPersistentInputsDirect(
     TRITONBACKEND_Request** requests, const uint32_t request_count,
     size_t total_batch_size, size_t slot)
 {
-  // Request by request: each request's inputs sit together in its own
-  // buffers, so this keeps the reads local.
-  gather_offsets_.assign(persistent_inputs_.size(), 0);
-  for (uint32_t r = 0; r < request_count; ++r) {
-    for (size_t i = 0; i < persistent_inputs_.size(); ++i) {
-      const PersistentInput& pi = persistent_inputs_[i];
-      if (!GatherInputRows(
-              pi, requests[r], pi.slots[slot].base,
-              pi.row_bytes * total_batch_size, &gather_offsets_[i])) {
+  gather_requests_ = requests;
+  gather_request_count_ = request_count;
+  gather_total_batch_size_ = total_batch_size;
+  gather_slot_ = slot;
+  gather_fj_.Run();
+  for (const uint8_t ok : gather_part_ok_) {
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool
+ModelInstanceState::GatherPersistentInputs(size_t part)
+{
+  // Input by input with a local offset, so each part touches only its own
+  // inputs and the writes into each staging buffer stay sequential.
+  for (const size_t i : gather_parts_[part]) {
+    const PersistentInput& pi = persistent_inputs_[i];
+    const size_t capacity = pi.row_bytes * gather_total_batch_size_;
+    char* base = pi.slots[gather_slot_].base;
+    size_t offset = 0;
+    for (uint32_t r = 0; r < gather_request_count_; ++r) {
+      if (!GatherInputRows(pi, gather_requests_[r], base, capacity, &offset)) {
         return false;
       }
     }
-  }
-  for (size_t i = 0; i < persistent_inputs_.size(); ++i) {
-    if (gather_offsets_[i] !=
-        persistent_inputs_[i].row_bytes * total_batch_size) {
+    if (offset != capacity) {
       return false;
     }
   }

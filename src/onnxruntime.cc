@@ -1693,6 +1693,7 @@ class ModelInstanceState : public BackendModelInstance {
       ModelState* model_state,
       TRITONBACKEND_ModelInstance* triton_model_instance);
   void ReleaseOrtRunResources(OrtIoBinding* binding);
+  void SynchronizeStream();
   TRITONSERVER_Error* ValidateBooleanSequenceControl(
       triton::common::TritonJson::Value& sequence_batching,
       const std::string& control_kind, bool required, bool* have_control);
@@ -2159,6 +2160,22 @@ ModelInstanceState::ReleaseOrtRunResources(OrtIoBinding* binding)
   input_tensor_memories_.clear();
 }
 
+void
+ModelInstanceState::SynchronizeStream()
+{
+#ifdef TRITON_ENABLE_GPU
+  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    cudaStreamSynchronize(CudaStream());
+  }
+#endif  // TRITON_ENABLE_GPU
+#ifdef TRITON_ENABLE_ROCM
+  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    static_cast<void>(
+        hipStreamSynchronize(static_cast<hipStream_t>(CudaStream())));
+  }
+#endif  // TRITON_ENABLE_ROCM
+}
+
 TRITONSERVER_Error*
 ModelInstanceState::ReadThreadingParameters()
 {
@@ -2308,29 +2325,20 @@ ModelInstanceState::RunPipelined(RunJob& job)
   uint64_t compute_end_ns = 0;
   SET_TIMESTAMP(compute_end_ns);
 
+  TRITONSERVER_Error* read_err = nullptr;
   if (!job.all_response_failed) {
-    RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
-        job.responses, request_count, job.all_response_failed,
-        ReadOutputTensors(
-            job.total_batch_size, job.requests.data(), request_count,
-            &job.responses, job.binding));
+    read_err = ReadOutputTensors(
+        job.total_batch_size, job.requests.data(), request_count,
+        &job.responses, job.binding);
   }
 
+  // Copies issued by the run or the output reads must finish before error
+  // responses free their buffers, outputs return to the arena, or the
+  // slot's pinned inputs are reused.
+  SynchronizeStream();
+  RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
+      job.responses, request_count, job.all_response_failed, read_err);
   ReleaseOrtRunResources(job.binding);
-
-  // The GPU may still be reading this slot's pinned inputs if nothing
-  // above waited on the stream; it must be done before the slot is reused.
-#ifdef TRITON_ENABLE_GPU
-  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
-    cudaStreamSynchronize(CudaStream());
-  }
-#endif  // TRITON_ENABLE_GPU
-#ifdef TRITON_ENABLE_ROCM
-  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
-    static_cast<void>(
-        hipStreamSynchronize(static_cast<hipStream_t>(CudaStream())));
-  }
-#endif  // TRITON_ENABLE_ROCM
   ReleaseSlot(job.slot);
 
   uint64_t exec_end_ns = 0;
@@ -3016,10 +3024,14 @@ ModelInstanceState::ProcessRequests(
   SET_TIMESTAMP(compute_end_ns);
 
   if (!all_response_failed) {
-    RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
-        responses, request_count, all_response_failed,
-        ReadOutputTensors(
-            total_batch_size, requests, request_count, &responses, binding));
+    TRITONSERVER_Error* read_err = ReadOutputTensors(
+        total_batch_size, requests, request_count, &responses, binding);
+    if (read_err != nullptr) {
+      // A failed read can return with copies still in flight.
+      SynchronizeStream();
+      RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
+          responses, request_count, all_response_failed, read_err);
+    }
   }
 
   uint64_t exec_end_ns = 0;

@@ -1740,8 +1740,8 @@ class ModelInstanceState : public BackendModelInstance {
   TRITONSERVER_Error* ReadOutputTensors(
       size_t total_batch_size, TRITONBACKEND_Request** requests,
       const uint32_t request_count,
-      std::vector<TRITONBACKEND_Response*>* responses,
-      OrtIoBinding* binding);
+      std::vector<TRITONBACKEND_Response*>* responses, OrtIoBinding* binding,
+      size_t slot);
 
   TRITONSERVER_Error* ReadOutputTensor(
       std::vector<int64_t>& batchn_shape, TRITONSERVER_DataType& dtype,
@@ -1868,10 +1868,22 @@ class ModelInstanceState : public BackendModelInstance {
   struct PersistentBinding {
     OrtIoBinding* binding{nullptr};
     std::vector<OrtValue*> input_tensors;
+    std::vector<OrtValue*> output_tensors;
   };
 
   bool use_persistent_input_binding_{false};
   std::vector<PersistentInput> persistent_inputs_;
+
+  // With 'persistent_output_binding' set, outputs also get slot-owned
+  // buffers bound once per slot and batch size, in the same order as
+  // 'output_plan_', so a run allocates, binds and releases no outputs.
+  // Needs persistent inputs and every output batched with fixed dims.
+  int persistent_output_binding_{0};
+  bool use_persistent_output_binding_{false};
+  std::vector<PersistentInput> persistent_outputs_;
+  TRITONSERVER_Error* InitPersistentOutputs(size_t max_batch);
+  TRITONSERVER_Error* AllocateStagingSlots(
+      PersistentInput* tensor, size_t max_batch);
   // Indexed [slot][batch size], index 0 unused. Every entry is built at
   // load and never modified afterwards; each slot's OrtValues wrap that
   // slot's own buffers.
@@ -2151,14 +2163,17 @@ ModelInstanceState::ReleaseOrtRunResources(OrtIoBinding* binding)
     input_tensors_.clear();
   }
 
-  // Outputs are allocated by ORT on every run, so always release them.
-  ort_api->ClearBoundOutputs(binding);
-  for (auto& tensor : output_tensors_) {
-    if (tensor != nullptr) {
-      ort_api->ReleaseValue(tensor);
+  // Outputs are allocated by ORT on every run unless they are persistent,
+  // in which case they stay bound to slot-owned buffers.
+  if (!use_persistent_output_binding_) {
+    ort_api->ClearBoundOutputs(binding);
+    for (auto& tensor : output_tensors_) {
+      if (tensor != nullptr) {
+        ort_api->ReleaseValue(tensor);
+      }
     }
+    output_tensors_.clear();
   }
-  output_tensors_.clear();
 
   // next release the allocated buffer using the specified allocator
   if (output_buffer_) {
@@ -2215,6 +2230,8 @@ ModelInstanceState::ReadThreadingParameters()
         params, "gather_threads", &gather_thread_count_, 1));
     RETURN_IF_ERROR(TryParseModelStringParameter(
         params, "stage_metrics", &stage_metrics_, 0));
+    RETURN_IF_ERROR(TryParseModelStringParameter(
+        params, "persistent_output_binding", &persistent_output_binding_, 0));
   }
   RETURN_ERROR_IF_TRUE(
       completion_thread_count_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
@@ -2492,7 +2509,7 @@ ModelInstanceState::RunPipelined(RunJob& job)
   if (!job.all_response_failed) {
     read_err = ReadOutputTensors(
         job.total_batch_size, job.requests.data(), request_count,
-        &job.responses, job.binding);
+        &job.responses, job.binding, job.slot);
   }
 
   // Copies issued by the run or the output reads must finish before error
@@ -3134,7 +3151,7 @@ ModelInstanceState::ProcessRequests(
         BuildOutputPlan(requests[0]));
   }
 
-  if (!all_response_failed) {
+  if (!all_response_failed && !use_persistent_output_binding_) {
     // Rebinding to a device resets the bound value, so ORT allocates fresh
     // outputs rather than treating last run's as pre-allocated buffers.
     for (const auto& op : output_plan_) {
@@ -3194,7 +3211,7 @@ ModelInstanceState::ProcessRequests(
 
   if (!all_response_failed) {
     TRITONSERVER_Error* read_err = ReadOutputTensors(
-        total_batch_size, requests, request_count, &responses, binding);
+        total_batch_size, requests, request_count, &responses, binding, slot);
     if (read_err != nullptr) {
       // A failed read can return with copies still in flight.
       SynchronizeStream();
@@ -3300,17 +3317,10 @@ ModelInstanceState::InitPersistentInputBinding()
       pi.type = info.type_;
       pi.row_bytes = row_elems * TRITONSERVER_DataTypeByteSize(
                                      ConvertFromOnnxDataType(info.type_));
-      pi.slots.resize(staging_slots_);
-      for (auto& slot : pi.slots) {
-        RETURN_IF_ERROR(BackendMemory::Create(
-            model_state_->TritonMemoryManager(),
-            {BackendMemory::AllocationType::CPU_PINNED_POOL,
-             BackendMemory::AllocationType::CPU},
-            0 /* memory_type_id */, pi.row_bytes * max_batch, &slot.memory));
-        slot.base = slot.memory->MemoryPtr();
-        slot.memory_type = slot.memory->MemoryType();
-        slot.memory_type_id = slot.memory->MemoryTypeId();
-      }
+      RETURN_IF_ERROR(AllocateStagingSlots(&pi, max_batch));
+    }
+    if (persistent_output_binding_ != 0) {
+      RETURN_IF_ERROR(InitPersistentOutputs(max_batch));
     }
 
     persistent_bindings_.assign(
@@ -3337,10 +3347,87 @@ ModelInstanceState::InitPersistentInputBinding()
       (std::string("persistent input binding enabled for ") +
        std::to_string(persistent_inputs_.size()) + " inputs at max batch " +
        std::to_string(max_batch) + ", staging slots " +
-       std::to_string(staging_slots_) + ", " +
+       std::to_string(staging_slots_) + ", persistent outputs " +
+       std::to_string(persistent_outputs_.size()) + ", " +
        std::to_string(staging_slots_ * max_batch) + " bindings built in " +
        std::to_string(build_ms) + " ms")
           .c_str());
+  return nullptr;
+}
+
+TRITONSERVER_Error*
+ModelInstanceState::AllocateStagingSlots(
+    PersistentInput* tensor, size_t max_batch)
+{
+  tensor->slots.resize(staging_slots_);
+  for (auto& slot : tensor->slots) {
+    RETURN_IF_ERROR(BackendMemory::Create(
+        model_state_->TritonMemoryManager(),
+        {BackendMemory::AllocationType::CPU_PINNED_POOL,
+         BackendMemory::AllocationType::CPU},
+        0 /* memory_type_id */, tensor->row_bytes * max_batch, &slot.memory));
+    slot.base = slot.memory->MemoryPtr();
+    slot.memory_type = slot.memory->MemoryType();
+    slot.memory_type_id = slot.memory->MemoryTypeId();
+  }
+  return nullptr;
+}
+
+TRITONSERVER_Error*
+ModelInstanceState::InitPersistentOutputs(size_t max_batch)
+{
+  // Ineligible models keep binding outputs per run.
+  auto skip = [this](const std::string& why) -> TRITONSERVER_Error* {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_WARN,
+        (std::string("persistent_output_binding ignored for '") + Name() +
+         "': " + why)
+            .c_str());
+    return nullptr;
+  };
+
+  std::vector<PersistentInput> outputs;
+  for (const auto& output : StateForModel()->ModelOutputs()) {
+    const std::string& name = output.first;
+    if ((output.second.first == -1) || (output.second.second != -1)) {
+      return skip("output '" + name + "' is a state output");
+    }
+    if (StateForModel()->FindBatchOutput(name) != nullptr) {
+      return skip("output '" + name + "' is a batch output");
+    }
+    auto iit = output_tensor_infos_.find(name);
+    if (iit == output_tensor_infos_.end()) {
+      return skip("output '" + name + "' has no tensor info");
+    }
+    const auto& info = iit->second;
+    if ((info.type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) ||
+        info.dims_.empty() || (info.dims_[0] >= 0) ||
+        std::any_of(info.dims_.begin() + 1, info.dims_.end(), [](int64_t d) {
+          return d < 0;
+        })) {
+      return skip(
+          "output '" + name + "' is not batched with fixed dims, got " +
+          ShapeToString(info.dims_));
+    }
+
+    outputs.emplace_back();
+    PersistentInput& po = outputs.back();
+    po.name = name;
+    po.dims = info.dims_;
+    po.type = info.type_;
+    int64_t row_elems = 1;
+    for (size_t i = 1; i < info.dims_.size(); i++) {
+      row_elems *= info.dims_[i];
+    }
+    po.row_bytes = row_elems * TRITONSERVER_DataTypeByteSize(
+                                   ConvertFromOnnxDataType(info.type_));
+  }
+
+  persistent_outputs_ = std::move(outputs);
+  for (auto& po : persistent_outputs_) {
+    RETURN_IF_ERROR(AllocateStagingSlots(&po, max_batch));
+  }
+  use_persistent_output_binding_ = true;
   return nullptr;
 }
 
@@ -3366,6 +3453,18 @@ ModelInstanceState::BuildPersistentBinding(
       RETURN_IF_ORT_ERROR(ort_api->BindInput(
           pb.binding, pi.name.c_str(), pb.input_tensors.back()));
     }
+    pb.output_tensors.reserve(persistent_outputs_.size());
+    for (const auto& po : persistent_outputs_) {
+      const StagingSlot& stg = po.slots[slot];
+      shape.assign(po.dims.begin(), po.dims.end());
+      shape[0] = static_cast<int64_t>(batch_size);
+      pb.output_tensors.emplace_back(nullptr);
+      RETURN_IF_ORT_ERROR(ort_api->CreateTensorWithDataAsOrtValue(
+          cpu_allocator_info_, stg.base, po.row_bytes * batch_size,
+          shape.data(), shape.size(), po.type, &pb.output_tensors.back()));
+      RETURN_IF_ORT_ERROR(ort_api->BindOutput(
+          pb.binding, po.name.c_str(), pb.output_tensors.back()));
+    }
     return nullptr;
   }();
   if (err != nullptr) {
@@ -3379,12 +3478,14 @@ ModelInstanceState::BuildPersistentBinding(
 void
 ModelInstanceState::ReleasePersistentBinding(PersistentBinding* pb)
 {
-  for (auto* tensor : pb->input_tensors) {
-    if (tensor != nullptr) {
-      ort_api->ReleaseValue(tensor);
+  for (auto* tensors : {&pb->input_tensors, &pb->output_tensors}) {
+    for (auto* tensor : *tensors) {
+      if (tensor != nullptr) {
+        ort_api->ReleaseValue(tensor);
+      }
     }
+    tensors->clear();
   }
-  pb->input_tensors.clear();
   if (pb->binding != nullptr) {
     ort_api->ReleaseIoBinding(pb->binding);
     pb->binding = nullptr;
@@ -3400,12 +3501,15 @@ ModelInstanceState::ReleasePersistentState()
     }
   }
   persistent_bindings_.clear();
-  for (auto& pi : persistent_inputs_) {
-    for (auto& slot : pi.slots) {
-      delete slot.memory;
+  for (auto* tensors : {&persistent_inputs_, &persistent_outputs_}) {
+    for (auto& pt : *tensors) {
+      for (auto& slot : pt.slots) {
+        delete slot.memory;
+      }
     }
+    tensors->clear();
   }
-  persistent_inputs_.clear();
+  use_persistent_output_binding_ = false;
 }
 
 TRITONSERVER_Error*
@@ -4105,7 +4209,8 @@ TRITONSERVER_Error*
 ModelInstanceState::ReadOutputTensors(
     size_t total_batch_size, TRITONBACKEND_Request** requests,
     const uint32_t request_count,
-    std::vector<TRITONBACKEND_Response*>* responses, OrtIoBinding* binding)
+    std::vector<TRITONBACKEND_Response*>* responses, OrtIoBinding* binding,
+    size_t slot)
 {
   BackendOutputResponder responder(
       requests, request_count, responses, model_state_->TritonMemoryManager(),
@@ -4115,14 +4220,26 @@ ModelInstanceState::ReadOutputTensors(
   // Use to hold string output contents
   bool cuda_copy = false;
 
-  output_tensors_.assign(output_plan_.size(), nullptr);
-  size_t output_count = 0;
-  RETURN_IF_ORT_ERROR(ort_api->GetBoundOutputValues(
-      binding, default_allocator_, &output_buffer_, &output_count));
-  if (output_count != output_plan_.size()) {
-    RETURN_IF_ERROR(TRITONSERVER_ErrorNew(
+  OrtValue* const* outputs = nullptr;
+  if (use_persistent_output_binding_) {
+    RETURN_ERROR_IF_TRUE(
+        persistent_outputs_.size() != output_plan_.size(),
         TRITONSERVER_ERROR_INTERNAL,
-        ("Retrieved output count is not equal to expected count.")));
+        std::string("persistent outputs do not match the output plan"));
+    outputs =
+        persistent_bindings_[slot][total_batch_size].output_tensors.data();
+  } else {
+    size_t output_count = 0;
+    RETURN_IF_ORT_ERROR(ort_api->GetBoundOutputValues(
+        binding, default_allocator_, &output_buffer_, &output_count));
+    // Recorded before any error return so every value gets released.
+    output_tensors_.assign(output_buffer_, output_buffer_ + output_count);
+    if (output_count != output_plan_.size()) {
+      RETURN_IF_ERROR(TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INTERNAL,
+          ("Retrieved output count is not equal to expected count.")));
+    }
+    outputs = output_buffer_;
   }
 
   const bool batch_confirmed =
@@ -4130,10 +4247,14 @@ ModelInstanceState::ReadOutputTensors(
       output_batch_confirmed_[total_batch_size];
   for (size_t idx = 0; idx < output_plan_.size(); idx++) {
     const auto& op = output_plan_[idx];
-    OrtValue* output_tensor = output_tensors_[idx] = output_buffer_[idx];
+    OrtValue* output_tensor = outputs[idx];
     const std::string& name = *op.name;
-    const std::pair<TRITONSERVER_MemoryType, int64_t> alloc_perference{
+    std::pair<TRITONSERVER_MemoryType, int64_t> alloc_perference{
         op.memory_type, op.memory_type_id};
+    if (use_persistent_output_binding_) {
+      const StagingSlot& stg = persistent_outputs_[idx].slots[slot];
+      alloc_perference = {stg.memory_type, stg.memory_type_id};
+    }
 
     const BatchOutput* batch_output = op.batch_output;
     if (batch_output == nullptr) {

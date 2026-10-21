@@ -46,6 +46,7 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -268,6 +269,10 @@ struct BackendConfiguration {
 
   bool enable_memory_tracker_{false};
   int default_max_batch_size_{0};
+  // Shared by every instance with 'stage_metrics' set; null when the server
+  // has metrics disabled.
+  TRITONSERVER_MetricFamily* stage_duration_family_{nullptr};
+  TRITONSERVER_MetricFamily* batch_requests_family_{nullptr};
 };
 
 //
@@ -1800,6 +1805,20 @@ class ModelInstanceState : public BackendModelInstance {
   WorkQueue<Completion> completion_q_;
   WorkQueue<ResponseBatch> response_q_;
 
+  // With 'stage_metrics' set, every successful execution observes its stage
+  // durations and request count into histograms on the metrics endpoint.
+  // Runner wait is only observed when pipelined.
+  enum Stage { kGather, kRunnerWait, kRun, kOutput, kStageCount };
+  int stage_metrics_{0};
+  std::array<TRITONSERVER_Metric*, kStageCount> stage_duration_metrics_{};
+  TRITONSERVER_Metric* batch_requests_metric_{nullptr};
+  void InitStageMetrics();
+  void ReleaseStageMetrics();
+  void ObserveStages(
+      uint64_t exec_start_ns, uint64_t gather_end_ns,
+      uint64_t compute_start_ns, uint64_t compute_end_ns,
+      uint64_t exec_end_ns, uint32_t request_count);
+
   // The full path to the ONNX model file.
   std::string model_path_;
 
@@ -1873,6 +1892,7 @@ class ModelInstanceState : public BackendModelInstance {
     size_t total_batch_size{0};
     bool all_response_failed{false};
     uint64_t exec_start_ns{0};
+    uint64_t gather_end_ns{0};
     std::vector<TRITONBACKEND_Request*> requests;
     std::vector<TRITONBACKEND_Response*> responses;
   };
@@ -2081,6 +2101,7 @@ ModelInstanceState::ModelInstanceState(
   THROW_IF_BACKEND_INSTANCE_ERROR(ValidateOutputs());
   THROW_IF_BACKEND_INSTANCE_ERROR(ReadThreadingParameters());
   THROW_IF_BACKEND_INSTANCE_ERROR(InitPersistentInputBinding());
+  InitStageMetrics();
   StartBackgroundThreads();
 }
 
@@ -2093,6 +2114,7 @@ ModelInstanceState::~ModelInstanceState()
   response_q_.Stop();
   completion_q_.Stop();
   gather_fj_.Stop();
+  ReleaseStageMetrics();
 
   ReleaseOrtRunResources(transient_binding_);
   ort_api->ReleaseRunOptions(runOptions_);
@@ -2182,6 +2204,8 @@ ModelInstanceState::ReadThreadingParameters()
         params, "pipeline_depth", &pipeline_depth_, 0));
     RETURN_IF_ERROR(TryParseModelStringParameter(
         params, "gather_threads", &gather_thread_count_, 1));
+    RETURN_IF_ERROR(TryParseModelStringParameter(
+        params, "stage_metrics", &stage_metrics_, 0));
   }
   RETURN_ERROR_IF_TRUE(
       completion_thread_count_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
@@ -2256,8 +2280,147 @@ ModelInstanceState::StartBackgroundThreads()
        ", async response send: " + (response_q_.Running() ? "on" : "off") +
        ", direct input gather: " + (direct_input_gather_ ? "on" : "off") +
        ", gather threads: " + std::to_string(gather_thread_count_) +
-       ", pipeline depth: " + std::to_string(pipeline_depth_))
+       ", pipeline depth: " + std::to_string(pipeline_depth_) +
+       ", stage metrics: " + (stage_metrics_ ? "on" : "off"))
           .c_str());
+}
+
+void
+ModelInstanceState::InitStageMetrics()
+{
+  if (stage_metrics_ == 0) {
+    return;
+  }
+#ifndef TRITON_ENABLE_STATS
+  LOG_MESSAGE(
+      TRITONSERVER_LOG_WARN,
+      "stage_metrics needs a backend built with statistics; ignoring it");
+  stage_metrics_ = 0;
+  return;
+#endif  // !TRITON_ENABLE_STATS
+
+  const auto& config =
+      BackendConfiguration::RetrieveFrom(TritonModelInstance());
+  if ((config.stage_duration_family_ == nullptr) ||
+      (config.batch_requests_family_ == nullptr)) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_WARN,
+        "stage_metrics is set but server metrics are unavailable; ignoring it");
+    stage_metrics_ = 0;
+    return;
+  }
+
+  const std::string version = std::to_string(model_state_->Version());
+  auto new_histogram = [&](TRITONSERVER_MetricFamily* family,
+                           const char* stage,
+                           const std::vector<double>& buckets,
+                           TRITONSERVER_Metric** metric) {
+    std::vector<std::pair<const char*, const char*>> kv{
+        {"model", model_state_->Name().c_str()},
+        {"version", version.c_str()},
+        {"instance", Name().c_str()}};
+    if (stage != nullptr) {
+      kv.emplace_back("stage", stage);
+    }
+    std::vector<const TRITONSERVER_Parameter*> labels;
+    for (const auto& [key, value] : kv) {
+      labels.push_back(
+          TRITONSERVER_ParameterNew(key, TRITONSERVER_PARAMETER_STRING, value));
+    }
+    TRITONSERVER_MetricArgs* args = nullptr;
+    TRITONSERVER_Error* err = TRITONSERVER_MetricArgsNew(&args);
+    if (err == nullptr) {
+      err = TRITONSERVER_MetricArgsSetHistogram(
+          args, buckets.data(), buckets.size());
+    }
+    if (err == nullptr) {
+      err = TRITONSERVER_MetricNewWithArgs(
+          metric, family, labels.data(), labels.size(), args);
+    }
+    if (args != nullptr) {
+      LOG_IF_ERROR(
+          TRITONSERVER_MetricArgsDelete(args), "failed to delete metric args");
+    }
+    for (const auto* label : labels) {
+      TRITONSERVER_ParameterDelete(const_cast<TRITONSERVER_Parameter*>(label));
+    }
+    return err;
+  };
+
+  const std::vector<double> duration_buckets{
+      50,   100,  200,  500,   1000,  1500,  2000,
+      3000, 4000, 6000, 8000, 12000, 20000, 50000};
+  std::vector<double> request_buckets;
+  const int max_requests = std::max(1, model_state_->MaxBatchSize());
+  for (int r = 1; r <= std::min(max_requests, 64); ++r) {
+    request_buckets.push_back(r);
+  }
+
+  static const char* stage_names[kStageCount] = {
+      "gather", "runner_wait", "run", "output"};
+  TRITONSERVER_Error* err = nullptr;
+  for (size_t s = 0; (s < kStageCount) && (err == nullptr); ++s) {
+    err = new_histogram(
+        config.stage_duration_family_, stage_names[s], duration_buckets,
+        &stage_duration_metrics_[s]);
+  }
+  if (err == nullptr) {
+    err = new_histogram(
+        config.batch_requests_family_, nullptr, request_buckets,
+        &batch_requests_metric_);
+  }
+  if (err != nullptr) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_WARN,
+        (std::string("failed to create stage metrics, ignoring them: ") +
+         TRITONSERVER_ErrorMessage(err))
+            .c_str());
+    TRITONSERVER_ErrorDelete(err);
+    ReleaseStageMetrics();
+    stage_metrics_ = 0;
+  }
+}
+
+void
+ModelInstanceState::ReleaseStageMetrics()
+{
+  for (auto*& metric : stage_duration_metrics_) {
+    if (metric != nullptr) {
+      LOG_IF_ERROR(TRITONSERVER_MetricDelete(metric), "failed to delete metric");
+      metric = nullptr;
+    }
+  }
+  if (batch_requests_metric_ != nullptr) {
+    LOG_IF_ERROR(
+        TRITONSERVER_MetricDelete(batch_requests_metric_),
+        "failed to delete metric");
+    batch_requests_metric_ = nullptr;
+  }
+}
+
+void
+ModelInstanceState::ObserveStages(
+    uint64_t exec_start_ns, uint64_t gather_end_ns, uint64_t compute_start_ns,
+    uint64_t compute_end_ns, uint64_t exec_end_ns, uint32_t request_count)
+{
+  if (stage_metrics_ == 0) {
+    return;
+  }
+  auto observe = [](TRITONSERVER_Metric* metric, uint64_t from, uint64_t to) {
+    const double us = (to > from) ? (to - from) / 1000.0 : 0.0;
+    LOG_IF_ERROR(
+        TRITONSERVER_MetricObserve(metric, us), "failed to observe metric");
+  };
+  observe(stage_duration_metrics_[kGather], exec_start_ns, gather_end_ns);
+  if (pipeline_) {
+    observe(
+        stage_duration_metrics_[kRunnerWait], gather_end_ns, compute_start_ns);
+  }
+  observe(stage_duration_metrics_[kRun], compute_start_ns, compute_end_ns);
+  observe(stage_duration_metrics_[kOutput], compute_end_ns, exec_end_ns);
+  LOG_IF_ERROR(
+      TRITONSERVER_MetricObserve(batch_requests_metric_, request_count),
+      "failed to observe metric");
 }
 
 size_t
@@ -2334,6 +2497,11 @@ ModelInstanceState::RunPipelined(RunJob& job)
 
   uint64_t exec_end_ns = 0;
   SET_TIMESTAMP(exec_end_ns);
+  if (!job.all_response_failed) {
+    ObserveStages(
+        job.exec_start_ns, job.gather_end_ns, compute_start_ns, compute_end_ns,
+        exec_end_ns, request_count);
+  }
 
   CompleteExecution(
       job.requests.data(), request_count, std::move(job.responses),
@@ -2995,6 +3163,7 @@ ModelInstanceState::ProcessRequests(
     job.exec_start_ns = exec_start_ns;
     job.requests.assign(requests, requests + request_count);
     job.responses = std::move(responses);
+    SET_TIMESTAMP(job.gather_end_ns);
     runner_q_.Push(std::move(job));
     // Triton forms the next batch when Execute returns, so return only once
     // the runner can take it; until then requests keep joining the queue.
@@ -3027,6 +3196,11 @@ ModelInstanceState::ProcessRequests(
 
   uint64_t exec_end_ns = 0;
   SET_TIMESTAMP(exec_end_ns);
+  if (!all_response_failed) {
+    ObserveStages(
+        exec_start_ns, compute_start_ns, compute_start_ns, compute_end_ns,
+        exec_end_ns, request_count);
+  }
 
   CompleteExecution(
       requests, request_count, std::move(responses), total_batch_size,
@@ -4277,6 +4451,23 @@ TRITONBACKEND_Initialize(TRITONBACKEND_Backend* backend)
   if (DeviceMemoryTracker::EnableFromBackendConfig(backend_config)) {
     lconfig->enable_memory_tracker_ = DeviceMemoryTracker::Init();
   }
+  TRITONSERVER_Error* metric_err = TRITONSERVER_MetricFamilyNew(
+      &lconfig->stage_duration_family_, TRITONSERVER_METRIC_KIND_HISTOGRAM,
+      "ort_backend_stage_duration_us",
+      "Time per execution spent in each backend stage, in microseconds");
+  if (metric_err == nullptr) {
+    metric_err = TRITONSERVER_MetricFamilyNew(
+        &lconfig->batch_requests_family_, TRITONSERVER_METRIC_KIND_HISTOGRAM,
+        "ort_backend_batch_requests", "Requests per execution");
+  }
+  if (metric_err != nullptr) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_VERBOSE,
+        (std::string("backend stage metrics unavailable: ") +
+         TRITONSERVER_ErrorMessage(metric_err))
+            .c_str());
+    TRITONSERVER_ErrorDelete(metric_err);
+  }
   RETURN_IF_ERROR(TRITONBACKEND_BackendSetState(
       backend, reinterpret_cast<void*>(lconfig.get())));
 
@@ -4296,7 +4487,16 @@ TRITONBACKEND_Finalize(TRITONBACKEND_Backend* backend)
       TRITONBACKEND_BackendState(backend, &state),
       "failed to get backend state");
   if (state != nullptr) {
-    delete reinterpret_cast<BackendConfiguration*>(state);
+    auto* config = reinterpret_cast<BackendConfiguration*>(state);
+    for (auto* family :
+         {config->stage_duration_family_, config->batch_requests_family_}) {
+      if (family != nullptr) {
+        LOG_IF_ERROR(
+            TRITONSERVER_MetricFamilyDelete(family),
+            "failed to delete metric family");
+      }
+    }
+    delete config;
   }
   return nullptr;  // success
 }

@@ -3027,11 +3027,13 @@ void
 ModelInstanceState::ProcessRequests(
     TRITONBACKEND_Request** requests, const uint32_t request_count)
 {
-  LOG_MESSAGE(
-      TRITONSERVER_LOG_VERBOSE,
-      (std::string("TRITONBACKEND_ModelExecute: Running ") + Name() + " with " +
-       std::to_string(request_count) + " requests")
-          .c_str());
+  if (TRITONSERVER_LogIsEnabled(TRITONSERVER_LOG_VERBOSE)) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_VERBOSE,
+        (std::string("TRITONBACKEND_ModelExecute: Running ") + Name() +
+         " with " + std::to_string(request_count) + " requests")
+            .c_str());
+  }
 
   uint64_t exec_start_ns = 0;
   SET_TIMESTAMP(exec_start_ns);
@@ -4957,12 +4959,14 @@ TRITONBACKEND_ModelInstanceExecute(
   // from this function so that it is again available to be used for
   // another call to TRITONBACKEND_ModelInstanceExecute.
 
-  LOG_MESSAGE(
-      TRITONSERVER_LOG_VERBOSE,
-      (std::string("model ") + model_state->Name() + ", instance " +
-       instance_state->Name() + ", executing " + std::to_string(request_count) +
-       " requests")
-          .c_str());
+  if (TRITONSERVER_LogIsEnabled(TRITONSERVER_LOG_VERBOSE)) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_VERBOSE,
+        (std::string("model ") + model_state->Name() + ", instance " +
+         instance_state->Name() + ", executing " +
+         std::to_string(request_count) + " requests")
+            .c_str());
+  }
 
   // At this point we accept ownership of 'requests', which means that
   // even if something goes wrong we must still return success from

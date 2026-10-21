@@ -1973,6 +1973,20 @@ class ModelInstanceState : public BackendModelInstance {
   std::vector<std::vector<char>> output_string_scratch_;
   std::vector<size_t> output_offsets_scratch_;
 
+  // Persistent outputs are written straight into responses using each
+  // request's batch size and requested outputs, read once per execution.
+  std::vector<int64_t> request_batch_scratch_;
+  std::vector<uint8_t> request_wants_scratch_;  // [request][output]
+  TRITONSERVER_Error* PrepareDirectOutputs(
+      size_t total_batch_size, TRITONBACKEND_Request** requests,
+      const uint32_t request_count,
+      std::vector<TRITONBACKEND_Response*>* responses);
+  bool WriteDirectOutput(
+      size_t idx, TRITONSERVER_DataType dtype,
+      std::vector<int64_t>& batchn_shape, const char* buffer,
+      TRITONSERVER_MemoryType memory_type, int64_t memory_type_id,
+      std::vector<TRITONBACKEND_Response*>* responses);
+
   // Onnx Runtime variables that will be reset and used for every run
   // on this instance.
   std::vector<OrtValue*> input_tensors_;
@@ -4242,6 +4256,11 @@ ModelInstanceState::ReadOutputTensors(
     outputs = output_buffer_;
   }
 
+  if (use_persistent_output_binding_) {
+    RETURN_IF_ERROR(PrepareDirectOutputs(
+        total_batch_size, requests, request_count, responses));
+  }
+
   const bool batch_confirmed =
       (total_batch_size < output_batch_confirmed_.size()) &&
       output_batch_confirmed_[total_batch_size];
@@ -4321,6 +4340,10 @@ ModelInstanceState::ReadOutputTensors(
           cuda_copy |= SetStringOutputBuffer(
               name, content, offsets.data(), &batchn_shape, requests,
               request_count, responses);
+        } else if (use_persistent_output_binding_ && output_fixed_ok_[idx]) {
+          cuda_copy |= WriteDirectOutput(
+              idx, dtype, batchn_shape, reinterpret_cast<char*>(output_buffer),
+              alloc_perference.first, alloc_perference.second, responses);
         } else {
           responder.ProcessTensor(
               name, dtype, batchn_shape, reinterpret_cast<char*>(output_buffer),
@@ -4376,6 +4399,107 @@ ModelInstanceState::ReadOutputTensors(
   }
 #endif  // TRITON_ENABLE_ROCM
   return nullptr;
+}
+
+TRITONSERVER_Error*
+ModelInstanceState::PrepareDirectOutputs(
+    size_t total_batch_size, TRITONBACKEND_Request** requests,
+    const uint32_t request_count,
+    std::vector<TRITONBACKEND_Response*>* responses)
+{
+  const size_t output_count = persistent_outputs_.size();
+  request_batch_scratch_.assign(request_count, 0);
+  request_wants_scratch_.assign(request_count * output_count, 0);
+
+  int64_t batch_offset = 0;
+  for (uint32_t r = 0; r < request_count; r++) {
+    TRITONBACKEND_Request* request = requests[r];
+    TRITONBACKEND_Input* input;
+    const int64_t* shape;
+    RETURN_IF_ERROR(TRITONBACKEND_RequestInputByIndex(request, 0, &input));
+    RETURN_IF_ERROR(TRITONBACKEND_InputProperties(
+        input, nullptr, nullptr, &shape, nullptr, nullptr, nullptr));
+    request_batch_scratch_[r] = shape[0];
+    batch_offset += shape[0];
+    RETURN_ERROR_IF_TRUE(
+        batch_offset > static_cast<int64_t>(total_batch_size),
+        TRITONSERVER_ERROR_INTERNAL,
+        std::string("requests' batch sizes exceed the output batch size ") +
+            std::to_string(total_batch_size));
+
+    auto& response = (*responses)[r];
+    if (response == nullptr) {
+      continue;
+    }
+    uint32_t requested = 0;
+    RESPOND_AND_SET_NULL_IF_ERROR(
+        &response, TRITONBACKEND_RequestOutputCount(request, &requested));
+    uint8_t* wants = request_wants_scratch_.data() + r * output_count;
+    // Requested names are unique model outputs, so a full count means all.
+    if (requested == output_count) {
+      std::fill(wants, wants + output_count, 1);
+      continue;
+    }
+    for (uint32_t k = 0; (k < requested) && (response != nullptr); k++) {
+      const char* name;
+      RESPOND_AND_SET_NULL_IF_ERROR(
+          &response, TRITONBACKEND_RequestOutputName(request, k, &name));
+      if (response == nullptr) {
+        break;
+      }
+      for (size_t o = 0; o < output_count; o++) {
+        if (persistent_outputs_[o].name == name) {
+          wants[o] = 1;
+          break;
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
+bool
+ModelInstanceState::WriteDirectOutput(
+    size_t idx, TRITONSERVER_DataType dtype, std::vector<int64_t>& batchn_shape,
+    const char* buffer, TRITONSERVER_MemoryType memory_type,
+    int64_t memory_type_id, std::vector<TRITONBACKEND_Response*>* responses)
+{
+  const PersistentInput& po = persistent_outputs_[idx];
+  const size_t output_count = persistent_outputs_.size();
+  bool cuda_copy = false;
+  size_t offset = 0;
+  for (size_t r = 0; r < responses->size(); r++) {
+    auto& response = (*responses)[r];
+    const size_t byte_size = po.row_bytes * request_batch_scratch_[r];
+    if ((response != nullptr) &&
+        request_wants_scratch_[r * output_count + idx]) {
+      batchn_shape[0] = request_batch_scratch_[r];
+      TRITONBACKEND_Output* output;
+      RESPOND_AND_SET_NULL_IF_ERROR(
+          &response, TRITONBACKEND_ResponseOutput(
+                         response, &output, po.name.c_str(), dtype,
+                         batchn_shape.data(), batchn_shape.size()));
+      void* dst = nullptr;
+      TRITONSERVER_MemoryType dst_type = memory_type;
+      int64_t dst_type_id = memory_type_id;
+      if (response != nullptr) {
+        RESPOND_AND_SET_NULL_IF_ERROR(
+            &response, TRITONBACKEND_OutputBuffer(
+                           output, &dst, byte_size, &dst_type, &dst_type_id));
+      }
+      if (response != nullptr) {
+        bool cuda_used = false;
+        RESPOND_AND_SET_NULL_IF_ERROR(
+            &response, CopyBuffer(
+                           po.name, memory_type, memory_type_id, dst_type,
+                           dst_type_id, byte_size, buffer + offset, dst,
+                           stream_, &cuda_used));
+        cuda_copy |= cuda_used;
+      }
+    }
+    offset += byte_size;
+  }
+  return cuda_copy;
 }
 
 bool

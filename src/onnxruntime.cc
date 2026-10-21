@@ -2499,17 +2499,22 @@ ModelInstanceState::ReleaseSlot(size_t slot)
 void
 ModelInstanceState::RunPipelined(RunJob& job)
 {
-  // The current device is per thread, and this thread isn't Triton's.
+  // The current device is per thread, and this thread isn't Triton's. Each
+  // runner thread serves a single instance, so setting it once is enough.
+  thread_local bool device_set = false;
+  if (!device_set) {
+    device_set = true;
 #ifdef TRITON_ENABLE_GPU
-  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
-    static_cast<void>(cudaSetDevice(DeviceId()));
-  }
+    if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+      static_cast<void>(cudaSetDevice(DeviceId()));
+    }
 #endif  // TRITON_ENABLE_GPU
 #ifdef TRITON_ENABLE_ROCM
-  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
-    static_cast<void>(hipSetDevice(DeviceId()));
-  }
+    if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+      static_cast<void>(hipSetDevice(DeviceId()));
+    }
 #endif  // TRITON_ENABLE_ROCM
+  }
 
   const uint32_t request_count = static_cast<uint32_t>(job.requests.size());
 

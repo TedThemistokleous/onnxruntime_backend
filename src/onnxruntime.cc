@@ -55,6 +55,7 @@
 #include <functional>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1715,13 +1716,19 @@ class ModelInstanceState : public BackendModelInstance {
       size_t total_batch_size, TRITONBACKEND_Request** requests,
       const uint32_t request_count,
       std::vector<TRITONBACKEND_Response*>* responses,
-      BackendInputCollector* collector, bool* cuda_copy, size_t slot,
-      OrtIoBinding** binding);
+      std::optional<BackendInputCollector>* collector, bool* cuda_copy,
+      size_t slot, OrtIoBinding** binding);
   TRITONSERVER_Error* InitPersistentInputBinding();
   TRITONSERVER_Error* SetInputTensorsPersistent(
       size_t total_batch_size, TRITONBACKEND_Request** requests,
-      const uint32_t request_count, BackendInputCollector* collector,
-      bool* cuda_copy, size_t slot, OrtIoBinding** binding);
+      const uint32_t request_count,
+      std::vector<TRITONBACKEND_Response*>* responses,
+      std::optional<BackendInputCollector>* collector, bool* cuda_copy,
+      size_t slot, OrtIoBinding** binding);
+  BackendInputCollector* EmplaceCollector(
+      std::optional<BackendInputCollector>* collector,
+      TRITONBACKEND_Request** requests, const uint32_t request_count,
+      std::vector<TRITONBACKEND_Response*>* responses);
   bool GatherPersistentInputsDirect(
       TRITONBACKEND_Request** requests, const uint32_t request_count,
       size_t total_batch_size, size_t slot);
@@ -3148,10 +3155,7 @@ ModelInstanceState::ProcessRequests(
 
   const size_t slot = pipeline_ ? AcquireSlot() : 0;
   bool cuda_copy = false;
-  BackendInputCollector collector(
-      requests, request_count, &responses, model_state_->TritonMemoryManager(),
-      model_state_->EnablePinnedInput(), CudaStream(), nullptr, nullptr, 0,
-      HostPolicyName().c_str());
+  std::optional<BackendInputCollector> collector;
   RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
       responses, request_count, all_response_failed,
       SetInputTensors(
@@ -3528,8 +3532,10 @@ ModelInstanceState::ReleasePersistentState()
 TRITONSERVER_Error*
 ModelInstanceState::SetInputTensorsPersistent(
     size_t total_batch_size, TRITONBACKEND_Request** requests,
-    const uint32_t request_count, BackendInputCollector* collector,
-    bool* cuda_copy, size_t slot, OrtIoBinding** binding)
+    const uint32_t request_count,
+    std::vector<TRITONBACKEND_Response*>* responses,
+    std::optional<BackendInputCollector>* collector_storage, bool* cuda_copy,
+    size_t slot, OrtIoBinding** binding)
 {
   const auto& slot_bindings = persistent_bindings_[slot];
   RETURN_ERROR_IF_TRUE(
@@ -3557,6 +3563,8 @@ ModelInstanceState::SetInputTensorsPersistent(
     return nullptr;
   }
 
+  BackendInputCollector* collector = EmplaceCollector(
+      collector_storage, requests, request_count, responses);
   for (const auto& pi : persistent_inputs_) {
     const StagingSlot& stg = pi.slots[slot];
     const size_t batchn_byte_size = pi.row_bytes * total_batch_size;
@@ -3579,6 +3587,18 @@ ModelInstanceState::SetInputTensorsPersistent(
 
   *cuda_copy |= collector->Finalize();
   return nullptr;
+}
+
+BackendInputCollector*
+ModelInstanceState::EmplaceCollector(
+    std::optional<BackendInputCollector>* collector,
+    TRITONBACKEND_Request** requests, const uint32_t request_count,
+    std::vector<TRITONBACKEND_Response*>* responses)
+{
+  return &collector->emplace(
+      requests, request_count, responses, model_state_->TritonMemoryManager(),
+      model_state_->EnablePinnedInput(), CudaStream(), nullptr, nullptr, 0,
+      HostPolicyName().c_str());
 }
 
 bool
@@ -3780,15 +3800,17 @@ ModelInstanceState::SetInputTensors(
     size_t total_batch_size, TRITONBACKEND_Request** requests,
     const uint32_t request_count,
     std::vector<TRITONBACKEND_Response*>* responses,
-    BackendInputCollector* collector, bool* cuda_copy, size_t slot,
-    OrtIoBinding** binding)
+    std::optional<BackendInputCollector>* collector_storage, bool* cuda_copy,
+    size_t slot, OrtIoBinding** binding)
 {
   if (use_persistent_input_binding_) {
     return SetInputTensorsPersistent(
-        total_batch_size, requests, request_count, collector, cuda_copy, slot,
-        binding);
+        total_batch_size, requests, request_count, responses,
+        collector_storage, cuda_copy, slot, binding);
   }
   *binding = transient_binding_;
+  BackendInputCollector* collector = EmplaceCollector(
+      collector_storage, requests, request_count, responses);
 
   const int max_batch_size = model_state_->MaxBatchSize();
 

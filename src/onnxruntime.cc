@@ -1943,9 +1943,18 @@ class ModelInstanceState : public BackendModelInstance {
     int64_t tensor_index{-1};
     int64_t state_index{-1};
     const std::vector<int64_t>* scalar_dims{nullptr};
+    // Model dims with the batch dimension first; only set when every other
+    // dim is fixed, so the shape follows from the batch size alone.
+    TRITONSERVER_DataType dtype{TRITONSERVER_TYPE_INVALID};
+    std::vector<int64_t> fixed_dims;
   };
   std::vector<OutputPlan> output_plan_;
   bool output_plan_built_{false};
+  // Owned by whichever thread reads outputs. An output uses its fixed shape
+  // once ORT has confirmed it at the current batch size; any mismatch turns
+  // the fixed shape off for that output.
+  std::vector<uint8_t> output_fixed_ok_;
+  std::vector<uint8_t> output_batch_confirmed_;
 
   // Reused across outputs and runs in ReadOutputTensors.
   std::vector<int64_t> output_shape_scratch_;
@@ -3619,14 +3628,35 @@ ModelInstanceState::BuildOutputPlan(TRITONBACKEND_Request* request)
     auto sit = scalar_outputs_.find(output.first);
     op.scalar_dims = (sit == scalar_outputs_.end()) ? nullptr : &sit->second;
 
+    if ((model_state_->MaxBatchSize() > 0) && (op.batch_output == nullptr) &&
+        (iit != output_tensor_infos_.end()) &&
+        (iit->second.type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) &&
+        (iit->second.dims_.size() > 1) && (iit->second.dims_[0] < 0) &&
+        std::all_of(
+            iit->second.dims_.begin() + 1, iit->second.dims_.end(),
+            [](int64_t d) { return d >= 0; })) {
+      op.dtype = ConvertFromOnnxDataType(iit->second.type_);
+      op.fixed_dims = iit->second.dims_;
+    }
+
     output_plan_.push_back(op);
   }
+
+  size_t fixed_count = 0;
+  output_fixed_ok_.assign(output_plan_.size(), 0);
+  for (size_t idx = 0; idx < output_plan_.size(); ++idx) {
+    output_fixed_ok_[idx] = !output_plan_[idx].fixed_dims.empty();
+    fixed_count += output_fixed_ok_[idx];
+  }
+  output_batch_confirmed_.assign(
+      static_cast<size_t>(std::max(0, model_state_->MaxBatchSize())) + 1, 0);
 
   output_plan_built_ = true;
   LOG_MESSAGE(
       TRITONSERVER_LOG_INFO,
       (std::string("output plan built for ") +
-       std::to_string(output_plan_.size()) + " outputs")
+       std::to_string(output_plan_.size()) + " outputs, " +
+       std::to_string(fixed_count) + " with fixed shapes")
           .c_str());
   return nullptr;
 }
@@ -4095,6 +4125,9 @@ ModelInstanceState::ReadOutputTensors(
         ("Retrieved output count is not equal to expected count.")));
   }
 
+  const bool batch_confirmed =
+      (total_batch_size < output_batch_confirmed_.size()) &&
+      output_batch_confirmed_[total_batch_size];
   for (size_t idx = 0; idx < output_plan_.size(); idx++) {
     const auto& op = output_plan_[idx];
     OrtValue* output_tensor = output_tensors_[idx] = output_buffer_[idx];
@@ -4120,9 +4153,31 @@ ModelInstanceState::ReadOutputTensors(
       TRITONSERVER_DataType dtype;
       void* output_buffer;
 
-      RETURN_IF_ERROR(ReadOutputTensor(
-          batchn_shape, dtype, output_tensor, &output_buffer, string_buffers,
-          offsets));
+      if (batch_confirmed && output_fixed_ok_[idx]) {
+        batchn_shape.assign(op.fixed_dims.begin(), op.fixed_dims.end());
+        batchn_shape[0] = static_cast<int64_t>(total_batch_size);
+        dtype = op.dtype;
+        RETURN_IF_ORT_ERROR(
+            ort_api->GetTensorMutableData(output_tensor, &output_buffer));
+      } else {
+        RETURN_IF_ERROR(ReadOutputTensor(
+            batchn_shape, dtype, output_tensor, &output_buffer, string_buffers,
+            offsets));
+        if (output_fixed_ok_[idx] &&
+            ((dtype != op.dtype) ||
+             (batchn_shape.size() != op.fixed_dims.size()) ||
+             (batchn_shape[0] != static_cast<int64_t>(total_batch_size)) ||
+             !std::equal(
+                 batchn_shape.begin() + 1, batchn_shape.end(),
+                 op.fixed_dims.begin() + 1))) {
+          output_fixed_ok_[idx] = 0;
+          LOG_MESSAGE(
+              TRITONSERVER_LOG_VERBOSE,
+              (std::string("output '") + name +
+               "' does not match its fixed shape; reading its shape per run")
+                  .c_str());
+        }
+      }
 
       // If the number of dimensions is equal to zero, it means that it is a
       // scalar and it would use the dimensions specified in the model
@@ -4180,6 +4235,10 @@ ModelInstanceState::ReadOutputTensors(
           name, *batch_output, output_buffer, alloc_perference.first,
           alloc_perference.second);
     }
+  }
+
+  if (total_batch_size < output_batch_confirmed_.size()) {
+    output_batch_confirmed_[total_batch_size] = 1;
   }
 
   // Finalize and wait for any pending buffer copies.

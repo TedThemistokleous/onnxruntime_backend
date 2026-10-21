@@ -46,6 +46,7 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -1852,11 +1853,15 @@ class ModelInstanceState : public BackendModelInstance {
 
   bool use_persistent_input_binding_{false};
   std::vector<PersistentInput> persistent_inputs_;
-  // One map per staging slot, keyed by batch size: each slot's OrtValues
-  // wrap that slot's own buffers.
+  // Indexed [slot][batch size], index 0 unused. Every entry is built at
+  // load and never modified afterwards; each slot's OrtValues wrap that
+  // slot's own buffers.
   size_t staging_slots_{1};
-  std::vector<std::unordered_map<size_t, PersistentBinding>>
-      persistent_bindings_;
+  std::vector<std::vector<PersistentBinding>> persistent_bindings_;
+  TRITONSERVER_Error* BuildPersistentBinding(
+      size_t slot, size_t batch_size, PersistentBinding* out);
+  void ReleasePersistentBinding(PersistentBinding* pb);
+  void ReleasePersistentState();
 
   // With 'pipeline_depth' set, Execute gathers into a free staging slot,
   // binds outputs and hands the batch to a runner thread, so the next batch
@@ -2091,21 +2096,7 @@ ModelInstanceState::~ModelInstanceState()
 
   ReleaseOrtRunResources(transient_binding_);
   ort_api->ReleaseRunOptions(runOptions_);
-  for (auto& slot_bindings : persistent_bindings_) {
-    for (auto& binding_pair : slot_bindings) {
-      for (auto* tensor : binding_pair.second.input_tensors) {
-        if (tensor != nullptr) {
-          ort_api->ReleaseValue(tensor);
-        }
-      }
-      ort_api->ReleaseIoBinding(binding_pair.second.binding);
-    }
-  }
-  for (auto& pi : persistent_inputs_) {
-    for (auto& slot : pi.slots) {
-      delete slot.memory;
-    }
-  }
+  ReleasePersistentState();
   ort_api->ReleaseIoBinding(transient_binding_);
   ort_api->ReleaseMemoryInfo(cuda_allocator_info_);
   if (session_ != nullptr) {
@@ -3109,34 +3100,53 @@ ModelInstanceState::InitPersistentInputBinding()
   }
 
   const size_t max_batch = static_cast<size_t>(model_state_->MaxBatchSize());
-  persistent_inputs_.reserve(names.size());
-  for (const auto& name : names) {
-    const auto& info = input_tensor_infos_.find(name)->second;
-    int64_t row_elems = 1;
-    for (size_t i = 1; i < info.dims_.size(); i++) {
-      row_elems *= info.dims_[i];
+  const auto build_start = std::chrono::steady_clock::now();
+  TRITONSERVER_Error* err = [&]() -> TRITONSERVER_Error* {
+    persistent_inputs_.reserve(names.size());
+    for (const auto& name : names) {
+      const auto& info = input_tensor_infos_.find(name)->second;
+      int64_t row_elems = 1;
+      for (size_t i = 1; i < info.dims_.size(); i++) {
+        row_elems *= info.dims_[i];
+      }
+
+      persistent_inputs_.emplace_back();
+      PersistentInput& pi = persistent_inputs_.back();
+      pi.name = name;
+      pi.dims = info.dims_;
+      pi.type = info.type_;
+      pi.row_bytes = row_elems * TRITONSERVER_DataTypeByteSize(
+                                     ConvertFromOnnxDataType(info.type_));
+      pi.slots.resize(staging_slots_);
+      for (auto& slot : pi.slots) {
+        RETURN_IF_ERROR(BackendMemory::Create(
+            model_state_->TritonMemoryManager(),
+            {BackendMemory::AllocationType::CPU_PINNED_POOL,
+             BackendMemory::AllocationType::CPU},
+            0 /* memory_type_id */, pi.row_bytes * max_batch, &slot.memory));
+        slot.base = slot.memory->MemoryPtr();
+        slot.memory_type = slot.memory->MemoryType();
+        slot.memory_type_id = slot.memory->MemoryTypeId();
+      }
     }
 
-    persistent_inputs_.emplace_back();
-    PersistentInput& pi = persistent_inputs_.back();
-    pi.name = name;
-    pi.dims = info.dims_;
-    pi.type = info.type_;
-    pi.row_bytes = row_elems * TRITONSERVER_DataTypeByteSize(
-                                   ConvertFromOnnxDataType(info.type_));
-    pi.slots.resize(staging_slots_);
-    for (auto& slot : pi.slots) {
-      RETURN_IF_ERROR(BackendMemory::Create(
-          model_state_->TritonMemoryManager(),
-          {BackendMemory::AllocationType::CPU_PINNED_POOL,
-           BackendMemory::AllocationType::CPU},
-          0 /* memory_type_id */, pi.row_bytes * max_batch, &slot.memory));
-      slot.base = slot.memory->MemoryPtr();
-      slot.memory_type = slot.memory->MemoryType();
-      slot.memory_type_id = slot.memory->MemoryTypeId();
+    persistent_bindings_.assign(
+        staging_slots_, std::vector<PersistentBinding>(max_batch + 1));
+    for (size_t slot = 0; slot < staging_slots_; ++slot) {
+      for (size_t b = 1; b <= max_batch; ++b) {
+        RETURN_IF_ERROR(
+            BuildPersistentBinding(slot, b, &persistent_bindings_[slot][b]));
+      }
     }
+    return nullptr;
+  }();
+  if (err != nullptr) {
+    ReleasePersistentState();
+    return err;
   }
-  persistent_bindings_.resize(staging_slots_);
+  const auto build_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - build_start)
+                            .count();
 
   use_persistent_input_binding_ = true;
   LOG_MESSAGE(
@@ -3144,9 +3154,75 @@ ModelInstanceState::InitPersistentInputBinding()
       (std::string("persistent input binding enabled for ") +
        std::to_string(persistent_inputs_.size()) + " inputs at max batch " +
        std::to_string(max_batch) + ", staging slots " +
-       std::to_string(staging_slots_))
+       std::to_string(staging_slots_) + ", " +
+       std::to_string(staging_slots_ * max_batch) + " bindings built in " +
+       std::to_string(build_ms) + " ms")
           .c_str());
   return nullptr;
+}
+
+TRITONSERVER_Error*
+ModelInstanceState::BuildPersistentBinding(
+    size_t slot, size_t batch_size, PersistentBinding* out)
+{
+  // Built aside and moved in only when complete, so a failure can't leave
+  // a partially bound binding in the table.
+  PersistentBinding pb;
+  TRITONSERVER_Error* err = [&]() -> TRITONSERVER_Error* {
+    RETURN_IF_ORT_ERROR(ort_api->CreateIoBinding(session_, &pb.binding));
+    pb.input_tensors.reserve(persistent_inputs_.size());
+    std::vector<int64_t> shape;
+    for (const auto& pi : persistent_inputs_) {
+      const StagingSlot& stg = pi.slots[slot];
+      shape.assign(pi.dims.begin(), pi.dims.end());
+      shape[0] = static_cast<int64_t>(batch_size);
+      pb.input_tensors.emplace_back(nullptr);
+      RETURN_IF_ORT_ERROR(ort_api->CreateTensorWithDataAsOrtValue(
+          cpu_allocator_info_, stg.base, pi.row_bytes * batch_size,
+          shape.data(), shape.size(), pi.type, &pb.input_tensors.back()));
+      RETURN_IF_ORT_ERROR(ort_api->BindInput(
+          pb.binding, pi.name.c_str(), pb.input_tensors.back()));
+    }
+    return nullptr;
+  }();
+  if (err != nullptr) {
+    ReleasePersistentBinding(&pb);
+    return err;
+  }
+  *out = std::move(pb);
+  return nullptr;
+}
+
+void
+ModelInstanceState::ReleasePersistentBinding(PersistentBinding* pb)
+{
+  for (auto* tensor : pb->input_tensors) {
+    if (tensor != nullptr) {
+      ort_api->ReleaseValue(tensor);
+    }
+  }
+  pb->input_tensors.clear();
+  if (pb->binding != nullptr) {
+    ort_api->ReleaseIoBinding(pb->binding);
+    pb->binding = nullptr;
+  }
+}
+
+void
+ModelInstanceState::ReleasePersistentState()
+{
+  for (auto& slot_bindings : persistent_bindings_) {
+    for (auto& pb : slot_bindings) {
+      ReleasePersistentBinding(&pb);
+    }
+  }
+  persistent_bindings_.clear();
+  for (auto& pi : persistent_inputs_) {
+    for (auto& slot : pi.slots) {
+      delete slot.memory;
+    }
+  }
+  persistent_inputs_.clear();
 }
 
 TRITONSERVER_Error*
@@ -3156,13 +3232,13 @@ ModelInstanceState::SetInputTensorsPersistent(
     std::vector<const char*>* input_names, bool* cuda_copy, size_t slot,
     OrtIoBinding** binding)
 {
-  auto& entry = persistent_bindings_[slot][total_batch_size];
-  const bool build = (entry.binding == nullptr);
-  if (build) {
-    RETURN_IF_ORT_ERROR(ort_api->CreateIoBinding(session_, &entry.binding));
-    entry.input_tensors.reserve(persistent_inputs_.size());
-  }
-  *binding = entry.binding;
+  const auto& slot_bindings = persistent_bindings_[slot];
+  RETURN_ERROR_IF_TRUE(
+      total_batch_size == 0 || total_batch_size >= slot_bindings.size(),
+      TRITONSERVER_ERROR_INTERNAL,
+      std::string("no persistent binding for batch size ") +
+          std::to_string(total_batch_size));
+  *binding = slot_bindings[total_batch_size].binding;
 
   bool gathered = false;
   if (direct_input_gather_ != 0) {
@@ -3198,17 +3274,6 @@ ModelInstanceState::SetInputTensorsPersistent(
           dst != stg.base, TRITONSERVER_ERROR_INTERNAL,
           std::string("input '") + pi.name +
               "' was not gathered into its persistent staging buffer");
-    }
-
-    if (build) {
-      std::vector<int64_t> batchn_shape(pi.dims.begin(), pi.dims.end());
-      batchn_shape[0] = static_cast<int64_t>(total_batch_size);
-      entry.input_tensors.emplace_back(nullptr);
-      RETURN_IF_ORT_ERROR(ort_api->CreateTensorWithDataAsOrtValue(
-          cpu_allocator_info_, stg.base, batchn_byte_size, batchn_shape.data(),
-          batchn_shape.size(), pi.type, &entry.input_tensors.back()));
-      RETURN_IF_ORT_ERROR(ort_api->BindInput(
-          entry.binding, pi.name.c_str(), entry.input_tensors.back()));
     }
     input_names->emplace_back(pi.name.c_str());
   }

@@ -1783,7 +1783,7 @@ class ModelInstanceState : public BackendModelInstance {
   TRITONSERVER_Error* ReadThreadingParameters();
   void StartBackgroundThreads();
   void CompleteExecution(
-      TRITONBACKEND_Request** requests, const uint32_t request_count,
+      std::vector<TRITONBACKEND_Request*>&& requests,
       std::vector<TRITONBACKEND_Response*>&& responses,
       size_t total_batch_size, bool all_response_failed,
       uint64_t exec_start_ns, uint64_t compute_start_ns,
@@ -2543,22 +2543,21 @@ ModelInstanceState::RunPipelined(RunJob& job)
   }
 
   CompleteExecution(
-      job.requests.data(), request_count, std::move(job.responses),
-      job.total_batch_size, job.all_response_failed, job.exec_start_ns,
+      std::move(job.requests), std::move(job.responses), job.total_batch_size, job.all_response_failed, job.exec_start_ns,
       compute_start_ns, compute_end_ns, exec_end_ns);
 }
 
 void
 ModelInstanceState::CompleteExecution(
-    TRITONBACKEND_Request** requests, const uint32_t request_count,
+    std::vector<TRITONBACKEND_Request*>&& requests,
     std::vector<TRITONBACKEND_Response*>&& responses, size_t total_batch_size,
     bool all_response_failed, uint64_t exec_start_ns,
     uint64_t compute_start_ns, uint64_t compute_end_ns, uint64_t exec_end_ns)
 {
   ResponseBatch batch;
   Completion& completion = batch.completion;
-  completion.requests.assign(requests, requests + request_count);
-  completion.success.reserve(request_count);
+  completion.requests = std::move(requests);
+  completion.success.reserve(responses.size());
   for (auto* response : responses) {
     completion.success.push_back(response != nullptr);
   }
@@ -3243,9 +3242,9 @@ ModelInstanceState::ProcessRequests(
   }
 
   CompleteExecution(
-      requests, request_count, std::move(responses), total_batch_size,
-      all_response_failed, exec_start_ns, compute_start_ns, compute_end_ns,
-      exec_end_ns);
+      std::vector<TRITONBACKEND_Request*>(requests, requests + request_count),
+      std::move(responses), total_batch_size, all_response_failed,
+      exec_start_ns, compute_start_ns, compute_end_ns, exec_end_ns);
 }
 
 TRITONSERVER_Error*

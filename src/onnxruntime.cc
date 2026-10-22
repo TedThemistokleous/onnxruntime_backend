@@ -1925,6 +1925,27 @@ class ModelInstanceState : public BackendModelInstance {
   std::vector<size_t> free_slots_;
   WorkQueue<RunJob> runner_q_;
 
+  // With 'jit_batch_formation' set, Execute returns once the runner is
+  // predicted to finish within the next gather plus 'formation_margin_us',
+  // rather than as soon as a slot frees, so each batch closes as late as
+  // the runner allows. At most one batch is then staged.
+  using Clock = std::chrono::steady_clock;
+  void WaitForFormationPoint();
+  // Moves 'est' toward 'sample' by 1/rise of the gap when the sample is
+  // larger and by 1/fall when it is smaller. The first sample is taken as is.
+  static void UpdateEstimate(
+      Clock::duration* est, Clock::duration sample, int rise, int fall);
+  int jit_batch_formation_{0};
+  int formation_margin_us_{200};
+  Clock::duration formation_margin_{0};
+  // Guarded by 'slot_mu_'.
+  bool runner_busy_{false};
+  size_t staged_jobs_{0};
+  Clock::time_point cycle_start_;
+  Clock::duration cycle_est_{0};
+  // Touched only by the thread calling Execute.
+  Clock::duration gather_est_{0};
+
   // With 'direct_input_gather' set, persistent inputs are copied straight
   // from the request buffers instead of through BackendInputCollector. Any
   // case the direct path can't handle sends the whole execution back to the
@@ -2252,7 +2273,15 @@ ModelInstanceState::ReadThreadingParameters()
         params, "stage_metrics", &stage_metrics_, 0));
     RETURN_IF_ERROR(TryParseModelStringParameter(
         params, "persistent_output_binding", &persistent_output_binding_, 0));
+    RETURN_IF_ERROR(TryParseModelStringParameter(
+        params, "jit_batch_formation", &jit_batch_formation_, 0));
+    RETURN_IF_ERROR(TryParseModelStringParameter(
+        params, "formation_margin_us", &formation_margin_us_, 200));
   }
+  RETURN_ERROR_IF_TRUE(
+      formation_margin_us_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
+      std::string("formation_margin_us must be >= 0"));
+  formation_margin_ = std::chrono::microseconds(formation_margin_us_);
   RETURN_ERROR_IF_TRUE(
       completion_thread_count_ < 0, TRITONSERVER_ERROR_INVALID_ARG,
       std::string("completion_threads must be >= 0"));
@@ -2317,6 +2346,8 @@ ModelInstanceState::StartBackgroundThreads()
     runner_q_.Start(
         1, staging_slots_ /* max_depth */,
         [this](RunJob& job) { RunPipelined(job); });
+  } else {
+    jit_batch_formation_ = 0;
   }
 
   LOG_MESSAGE(
@@ -2327,6 +2358,10 @@ ModelInstanceState::StartBackgroundThreads()
        ", direct input gather: " + (direct_input_gather_ ? "on" : "off") +
        ", gather threads: " + std::to_string(gather_thread_count_) +
        ", pipeline depth: " + std::to_string(pipeline_depth_) +
+       ", jit batch formation: " +
+       (jit_batch_formation_
+            ? "on (margin " + std::to_string(formation_margin_us_) + " us)"
+            : std::string("off")) +
        ", stage metrics: " + (stage_metrics_ ? "on" : "off"))
           .c_str());
 }
@@ -2497,8 +2532,51 @@ ModelInstanceState::ReleaseSlot(size_t slot)
 }
 
 void
+ModelInstanceState::UpdateEstimate(
+    Clock::duration* est, Clock::duration sample, int rise, int fall)
+{
+  if (est->count() == 0) {
+    *est = sample;
+    return;
+  }
+  const auto gap = sample - *est;
+  *est += gap / ((gap.count() > 0) ? rise : fall);
+}
+
+void
+ModelInstanceState::WaitForFormationPoint()
+{
+  std::unique_lock<std::mutex> lk(slot_mu_);
+  for (;;) {
+    if (free_slots_.empty() || (staged_jobs_ > 0)) {
+      slot_cv_.wait(lk);
+      continue;
+    }
+    if (!runner_busy_) {
+      return;
+    }
+    const Clock::duration lead =
+        std::min(cycle_est_, gather_est_ + formation_margin_);
+    if (slot_cv_.wait_until(lk, cycle_start_ + cycle_est_ - lead) ==
+        std::cv_status::timeout) {
+      return;
+    }
+  }
+}
+
+void
 ModelInstanceState::RunPipelined(RunJob& job)
 {
+  if (jit_batch_formation_) {
+    {
+      std::lock_guard<std::mutex> lk(slot_mu_);
+      --staged_jobs_;
+      runner_busy_ = true;
+      cycle_start_ = Clock::now();
+    }
+    slot_cv_.notify_one();
+  }
+
   // The current device is per thread, and this thread isn't Triton's. Each
   // runner thread serves a single instance, so setting it once is enough.
   thread_local bool device_set = false;
@@ -2557,6 +2635,17 @@ ModelInstanceState::RunPipelined(RunJob& job)
   CompleteExecution(
       std::move(job.requests), std::move(job.responses), job.total_batch_size, job.all_response_failed, job.exec_start_ns,
       compute_start_ns, compute_end_ns, exec_end_ns);
+
+  if (jit_batch_formation_) {
+    {
+      std::lock_guard<std::mutex> lk(slot_mu_);
+      // A late prediction idles the runner, so long cycles pull the
+      // estimate up more slowly than short ones pull it down.
+      UpdateEstimate(&cycle_est_, Clock::now() - cycle_start_, 16, 4);
+      runner_busy_ = false;
+    }
+    slot_cv_.notify_one();
+  }
 }
 
 void
@@ -3048,6 +3137,8 @@ ModelInstanceState::ProcessRequests(
 
   uint64_t exec_start_ns = 0;
   SET_TIMESTAMP(exec_start_ns);
+  const Clock::time_point entry =
+      jit_batch_formation_ ? Clock::now() : Clock::time_point{};
 
   const int max_batch_size = model_state_->MaxBatchSize();
 
@@ -3212,10 +3303,20 @@ ModelInstanceState::ProcessRequests(
     job.requests.assign(requests, requests + request_count);
     job.responses = std::move(responses);
     SET_TIMESTAMP(job.gather_end_ns);
+    if (jit_batch_formation_) {
+      // An overestimate only returns early, so long gathers count quickly.
+      UpdateEstimate(&gather_est_, Clock::now() - entry, 2, 16);
+      std::lock_guard<std::mutex> lk(slot_mu_);
+      ++staged_jobs_;
+    }
     runner_q_.Push(std::move(job));
     // Triton forms the next batch when Execute returns, so return only once
     // the runner can take it; until then requests keep joining the queue.
-    WaitForFreeSlot();
+    if (jit_batch_formation_) {
+      WaitForFormationPoint();
+    } else {
+      WaitForFreeSlot();
+    }
     return;
   }
 
